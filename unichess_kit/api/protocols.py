@@ -59,8 +59,12 @@ class Referee(Protocol):
 
 @runtime_checkable
 class RecordSink(Protocol):
-    """自对弈训练数据的落盘方式（格式归引擎所有）。"""
+    """自对弈训练数据的落盘方式（格式归引擎所有）。
 
-    def on_move(self, board: chess.Board, decision: MoveDecision) -> None: ...
+    每局结束时调用一次（按**完成顺序**；并发 1 时即局序）：record 为结果记录，
+    board 为终局局面（带完整着法栈），decisions 为逐 ply 的 MoveDecision（训练目标在
+    decision.info 里，内容由引擎的 Player 与 Sink 约定）。
+    """
 
-    def on_game_end(self, record: dict) -> None: ...
+    def on_game_end(self, record: dict, board: chess.Board,
+                    decisions: Sequence[MoveDecision]) -> None: ...

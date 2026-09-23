@@ -64,12 +64,23 @@ class GameStart:
     """开局信息。opening 是从起始局面出发、已经走完的开局着法（UCI）。
 
     起始局面默认是标准初始局面；fen 非空时从该局面开始（Server 的自定义局面对局）。
+
+    自对弈（``pipelines.selfplay``）另用：
+    - both_sides：同一个 Player 执双方（color 无意义），每步 observe 只调用一次；
+    - book：opening 之后**仍经 choose** 的强制着法（UCI）。Player 必须原样走出，但照常搜索，
+      以便给这些局面产出训练目标（S 的 book ply π′）；管线会校验，走错即 PlayerError；
+    - book_id：book 在开局库里的序号（跨局共享搜索结果的键），无 book 时为 None；
+    - index：本局在整次运行中的序号（派生每局随机数流）。
     """
     color: bool                              # 本 Player 执哪方（chess.WHITE / BLACK）
     seed: int = 0
     opening: tuple = ()
     game_id: str = ""
     fen: Optional[str] = None
+    both_sides: bool = False
+    book: tuple = ()
+    book_id: Optional[int] = None
+    index: int = 0
 
     def board(self) -> chess.Board:
         b = chess.Board(self.fen) if self.fen else chess.Board()
