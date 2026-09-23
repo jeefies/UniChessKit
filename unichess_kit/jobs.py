@@ -16,7 +16,7 @@ job.json::
     {"kind": "match" | "game",
      "a": EngineSpec, "b": EngineSpec, "names": {"A": "...", "B": "..."},
      "match": MatchConfig 字段,                        # kind=match
-     "game": {"max_plies": 400, "seed": 0, "opening": []},  # kind=game：A 执白、B 执黑，一局
+     "game": {"max_plies": 400, "seed": 0, "opening": [], "fen": None},  # kind=game：一局，A 执白
      "gpu_mib": 4096}                                   # 0 = 不申请租约（CPU 引擎）
 
 停止：向进程组发 SIGTERM（``JobHandle.stop``），状态记为 stopped；已完成的局都已入库。
@@ -104,7 +104,8 @@ class _Live:
             g = str(ev["game"])
             if ev["type"] == "game_start":
                 self.games[g] = {"game": ev["game"], "pair": ev.get("pair"), "white": ev["white"],
-                                 "opening": ev["opening"], "moves": [], "details": [],
+                                 "opening": ev["opening"], "fen": ev.get("fen"),
+                                 "moves": [], "details": [],
                                  "started_at": time.time(), "done": False}
             elif ev["type"] == "move" and g in self.games:
                 game = self.games[g]
@@ -153,8 +154,9 @@ def _run_game(job: dict, job_dir: Path, live: _Live, status: _Status) -> dict:
     spec_a, spec_b = EngineSpec.from_dict(job["a"]), EngineSpec.from_dict(job["b"])
     make_a = build_player_factory(spec_a)
     make_b = build_player_factory(spec_b)
-    task = GameTask(game=0, pair=0, a_is_white=True, opening=tuple(g.get("opening", ())),
-                    seed_a=_seed(seed, 0, "A"), seed_b=_seed(seed, 0, "B"))
+    task = GameTask(game=0, pair=0, a_is_white=(g.get("a_color", "white") == "white"),
+                    opening=tuple(g.get("opening", ())), seed_a=_seed(seed, 0, "A"),
+                    seed_b=_seed(seed, 0, "B"), fen=g.get("fen") or None)
     status.update(state="running", games_planned=1)
     record = run_sync(play_game(task, make_a(), make_b(),
                                 StandardReferee(max_plies=int(g.get("max_plies", 400))),
@@ -248,8 +250,10 @@ class JobHandle:
 
     @classmethod
     def submit(cls, job_dir, job: dict, *, python: str = sys.executable,
-               env: Optional[dict] = None) -> "JobHandle":
-        job_dir = Path(job_dir)
+               env: Optional[dict] = None, cwd=None) -> "JobHandle":
+        """cwd 默认为 job 目录：调用方工作目录里的同名模块（如 Server 的 jobs.py / models）
+        不会因 ``python -m`` 把 cwd 放进 sys.path 而遮蔽引擎的导入。"""
+        job_dir = Path(job_dir).resolve()
         job_dir.mkdir(parents=True, exist_ok=False)
         write_json_atomic(job_dir / "job.json", job)
         log = open(job_dir / "job.log", "ab")
@@ -261,7 +265,7 @@ class JobHandle:
         try:
             proc = subprocess.Popen([python, "-m", "unichess_kit.jobs", str(job_dir)],
                                     stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                    env=env, **kwargs)
+                                    env=env, cwd=str(cwd or job_dir), **kwargs)
         finally:
             log.close()
         handle = cls(job_dir)

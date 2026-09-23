@@ -98,6 +98,7 @@ class GameTask:
     opening: tuple
     seed_a: int
     seed_b: int
+    fen: Optional[str] = None           # 起始局面（None = 标准初始局面；批量对弈不用）
 
 
 def _seed(base: int, game: int, side: str) -> int:
@@ -138,19 +139,21 @@ def play_game(task: GameTask, player_a, player_b, referee: StandardReferee,
     white, black = (player_a, player_b) if task.a_is_white else (player_b, player_a)
     side_of = {id(player_a): "A", id(player_b): "B"}
     sources = {"A": Counter(), "B": Counter()}
-    board = chess.Board()
+    board = chess.Board(task.fen) if task.fen else chess.Board()
     try:
         for uci in task.opening:
             board.push_uci(uci)
         yield from player_a.new_game(GameStart(color=task.a_is_white, seed=task.seed_a,
-                                               opening=task.opening, game_id=f"g{task.game}"))
+                                               opening=task.opening, game_id=f"g{task.game}",
+                                               fen=task.fen))
         yield from player_b.new_game(GameStart(color=not task.a_is_white, seed=task.seed_b,
-                                               opening=task.opening, game_id=f"g{task.game}"))
+                                               opening=task.opening, game_id=f"g{task.game}",
+                                               fen=task.fen))
         moves = []
         if observer is not None:
             observer({"type": "game_start", "game": task.game, "pair": task.pair,
                       "white": "A" if task.a_is_white else "B",
-                      "opening": list(task.opening)})
+                      "opening": list(task.opening), "fen": task.fen})
         while True:
             verdict = referee.verdict(board)
             if verdict is not None:

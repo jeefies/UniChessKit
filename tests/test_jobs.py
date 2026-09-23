@@ -99,6 +99,20 @@ class TestJobs(unittest.TestCase):
         self.assertEqual(st["summary"]["result"], rec["result"])
         self.assertEqual(st["games_done"], 1)
 
+    def test_game_job_from_fen(self):
+        fen = "4k3/8/8/8/8/8/4P3/4K2R b K - 0 1"            # 黑先
+        h = self.submit("g2", {"kind": "game", "a": RANDOM, "b": FAKE,
+                               "game": {"max_plies": 20, "seed": 1, "fen": fen}})
+        self.assertEqual(wait_final(h), "completed", (h.dir / "job.log").read_text("utf-8"))
+        (rec,) = h.records()
+        live = h.live()["games"]["0"]
+        self.assertEqual(live["fen"], fen)
+        board = chess.Board(fen)
+        for i, uci in enumerate(rec["moves"]):
+            board.push_uci(uci)                             # 从给定局面起全部合法
+            self.assertEqual(live["details"][i]["side"], "B" if i % 2 == 0 else "A")
+        self.assertLessEqual(rec["plies"], 20)
+
     def test_match_job_summary_per_model(self):
         h = self.submit("m1", {"kind": "match", "a": FAKE, "b": RANDOM,
                                "names": {"A": "fake", "B": "random"},
