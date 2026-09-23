@@ -13,6 +13,7 @@ from typing import Optional
 import chess
 
 from ..api.types import Verdict
+from .fast import outcome as fast_outcome
 
 TERMINATION_REASON = {
     chess.Termination.CHECKMATE: "checkmate",
@@ -29,7 +30,7 @@ TRUNCATED = Verdict(result="1/2-1/2", termination="truncated", winner=None)
 
 def classify(board: chess.Board) -> Optional[Verdict]:
     """规则终局 → Verdict；未终局 → None。"""
-    outcome = board.outcome(claim_draw=True)
+    outcome = fast_outcome(board, claim_draw=True)     # 与 board.outcome(claim_draw=True) 逐项相同
     if outcome is None:
         return None
     reason = TERMINATION_REASON.get(outcome.termination)

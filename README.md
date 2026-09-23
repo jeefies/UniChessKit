@@ -58,6 +58,7 @@ python -m unichess_kit.match match.json --out runs/t_vs_r/results.jsonl
 
 - 第 2p 局 A 执白、第 2p+1 局 B 执白，同一对共用开局；结果按模型 A/B 计分，同时给出五项 Elo。
 - `root` 做路径隔离：模块文件必须在该目录下，同名顶层包来自别处时直接报错。
+- `runtime`（可选）：只影响运行方式、不影响结果的工厂参数（如 S 的 `pool_slots`、临时 GPU 服务目录），传给工厂但不进配置哈希；与 `kwargs` 重名报错。
 - 结果 JSONL 首行是含 `config_hash` 的表头，每局一行 fsync；中断后同一命令续跑，末尾半行自动丢弃。
 - 汇总写到 `<out>.summary.json`，含 `duplicate_rate`（确定性双方逐局重复时会暴露出来）。
 

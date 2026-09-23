@@ -30,6 +30,22 @@ class TestRegistry(unittest.TestCase):
                                             kwargs={"x": 1}))
         self.assertEqual(f(), {"x": 1})
 
+    def test_runtime_kwargs_passed_but_not_in_identity(self):
+        """runtime（如临时服务目录）传给工厂，但不进 identity() → 不改配置哈希，续跑可换。"""
+        root = self.make_pkg("rt", "kitreg_rt", "def make(**kw):\n    return lambda: kw\n")
+        spec = EngineSpec(factory="kitreg_rt:make", root=str(root), kwargs={"x": 1},
+                          runtime={"server_dir": "/tmp/a"})
+        self.assertEqual(build_player_factory(spec)(), {"x": 1, "server_dir": "/tmp/a"})
+        other = EngineSpec(factory="kitreg_rt:make", root=str(root), kwargs={"x": 1},
+                           runtime={"server_dir": "/tmp/b"})
+        self.assertEqual(spec.identity(), other.identity())
+        self.assertNotIn("runtime", spec.identity())
+        self.assertEqual(EngineSpec.from_dict(spec.to_dict()), spec)
+        self.assertNotIn("runtime", EngineSpec(factory="a:b").to_dict())
+        with self.assertRaisesRegex(RegistryError, "重复"):
+            build_player_factory(EngineSpec(factory="kitreg_rt:make", root=str(root),
+                                            kwargs={"x": 1}, runtime={"x": 2}))
+
     def test_same_top_level_from_other_root_rejected(self):
         """R/T 同名顶层包的老问题：第二个根目录的同名包必须报错，而不是静默复用第一个。"""
         r1 = self.make_pkg("one", "kitreg_core", "V = 1\n")

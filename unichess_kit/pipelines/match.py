@@ -421,7 +421,7 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
     if names is None:
         names = ({"A": spec_a.name, "B": spec_b.name} if spec_a is not None
                  else {"A": getattr(make_a, "name", "A"), "B": getattr(make_b, "name", "B")})
-    players_id = ({"A": spec_a.to_dict(), "B": spec_b.to_dict()} if spec_a is not None
+    players_id = ({"A": spec_a.identity(), "B": spec_b.identity()} if spec_a is not None
                   else dict(names))
 
     book = load_book(cfg.openings)

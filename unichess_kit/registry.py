@@ -33,18 +33,28 @@ class EngineSpec:
     root: Optional[str] = None         # 引擎仓库根目录（放进 sys.path）
     kwargs: dict = field(default_factory=dict)
     label: str = ""                    # 结果里显示的名字；空则用 factory
+    # 只影响怎么跑、不影响结果的参数（如本次运行的临时服务目录）：同样传给工厂，
+    # 但不进 identity()，因而不进结果文件的配置哈希（续跑时可以不同）
+    runtime: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "EngineSpec":
-        unknown = set(d) - {"factory", "root", "kwargs", "label"}
+        unknown = set(d) - {"factory", "root", "kwargs", "label", "runtime"}
         if unknown:
             raise RegistryError(f"EngineSpec 有未知字段 {sorted(unknown)}")
         return cls(factory=d["factory"], root=d.get("root"), kwargs=dict(d.get("kwargs", {})),
-                   label=d.get("label", ""))
+                   label=d.get("label", ""), runtime=dict(d.get("runtime", {})))
 
-    def to_dict(self) -> dict:
+    def identity(self) -> dict:
+        """决定结果的部分（进配置哈希）。"""
         return {"factory": self.factory, "root": self.root, "kwargs": self.kwargs,
                 "label": self.label}
+
+    def to_dict(self) -> dict:
+        d = self.identity()
+        if self.runtime:
+            d["runtime"] = self.runtime
+        return d
 
     @property
     def name(self) -> str:
@@ -90,7 +100,10 @@ def load_object(target: str, root: Optional[str] = None) -> Any:
 
 def build_player_factory(spec: EngineSpec):
     factory = load_object(spec.factory, spec.root)
-    player_factory = factory(**spec.kwargs)
+    overlap = set(spec.kwargs) & set(spec.runtime)
+    if overlap:
+        raise RegistryError(f"kwargs 与 runtime 有重复参数 {sorted(overlap)}")
+    player_factory = factory(**spec.kwargs, **spec.runtime)
     if not callable(player_factory):
         raise RegistryError(f"{spec.factory} 应返回可调用的 PlayerFactory")
     return player_factory

@@ -17,6 +17,7 @@ S/T/R 共享的管线库。设计与分阶段计划：`~/.claude/plans/s-ply-daz
 - 出错整批停止，不留"运行中"假象；非法着法抛 `PlayerError`。
 - 裁决统一 `claim_draw=True`；超 `max_plies` 记 truncated，按和棋计分但单独统计。
 - 续跑拒绝配置哈希不同的结果文件；中间行损坏报错，末尾半行丢弃。
+- 配置哈希只用 `EngineSpec.identity()`（不含 `runtime`）；会改变结果的参数必须放 `kwargs`——`test_registry`。
 - `PUCT` 与 R `search/mcts.py` 逐节点一致（parity 测试），改搜索先让 parity 失败有理由。
 
 ## 开发

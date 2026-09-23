@@ -30,7 +30,10 @@ from typing import Any, Optional
 import chess
 import numpy as np
 
+from ..api import gather
 from ..api.types import Leaf, NodeEval, Think
+from ..rules.fast import copy_board
+from ..rules.fast import outcome as fast_outcome
 
 # ---- S 锁定超参（§2.2 / §3）----
 C_VISIT = 50.0          # σ 的访问数偏置
@@ -225,8 +228,13 @@ def _hist_add(hist: list, depth: int) -> None:
 def order_halving_gen(root: Node, expand, n_sims: int = N_SIMS, m0: int = M0, g: float = 1.0,
                       rng: Optional[np.random.Generator] = None, c_visit: float = C_VISIT,
                       c_scale: float = C_SCALE, qmin: Optional[float] = None,
-                      qmax: Optional[float] = None) -> Think[dict]:
+                      qmax: Optional[float] = None, parallel: bool = False) -> Think[dict]:
     """根节点顺序减半（协程）。``expand(parent, action)`` 为生成器，return 子 Node（不得为 None）。
+
+    parallel=True：同一轮里各候选的第 j 次模拟并发执行（``gather`` 合并成一次请求）。
+    候选子树互不相交、根上各记各的边，轮内的根打分只在轮末做，所以结果与串行**逐位相同**
+    （前提是 expand 的结果不依赖拼批——S 的前向随批大小有 ~1e-5 差异，因此只在并发 1 下
+    与串行逐位一致）；一步搜索的串行拍数从 n_sims 降到 Σ⌈预算/候选数⌉（256/16 时 60）。
 
     返回 dict：action, noise, sims_used, rounds, budget_check, survivors_per_round, qmin, qmax,
     n_nodes, n_terminal, max_depth, expand_hist（按新节点深度计数）, tree。
@@ -298,11 +306,19 @@ def order_halving_gen(root: Node, expand, n_sims: int = N_SIMS, m0: int = M0, g:
         if len(surv) == 1:
             budget = sum(budget_per_round[r:])       # 唯一候选：剩余预算全部投入（预算守恒）
         per_base, per_rem = divmod(budget, len(surv))
-        for i, c in enumerate(surv):
-            k = per_base + (1 if i < per_rem else 0)
-            for _ in range(k):
-                yield from _sim_root(c)
-            sims_used += k
+        ks = [per_base + (1 if i < per_rem else 0) for i in range(len(surv))]
+        if parallel:
+            for j in range(max(ks)):
+                batch = [c for c, k in zip(surv, ks) if j < k]
+                if len(batch) == 1:
+                    yield from _sim_root(batch[0])
+                else:
+                    yield from gather([_sim_root(c) for c in batch])
+        else:
+            for c, k in zip(surv, ks):
+                for _ in range(k):
+                    yield from _sim_root(c)
+        sims_used += sum(ks)
         l_root = {int(a): float(x) for a, x in zip(root.legal, root.logits)}
         s_root = qtransform_completed(root, c_visit, c_scale)
         s_map = {int(a): float(x) for a, x in zip(root.legal, s_root)}
@@ -347,6 +363,7 @@ class GumbelConfig:
     c_visit: float = C_VISIT
     c_scale: float = C_SCALE
     claim_draw: bool = True         # 搜索内把可申和（三次重复 / 五十步）当终局（S 口径）
+    parallel: bool = True           # 轮内各候选并发模拟（见 order_halving_gen；False = 原串行次序）
 
 
 @dataclass
@@ -365,7 +382,10 @@ class GumbelResult:
 
 def terminal_q(board: chess.Board, claim_draw: bool = True) -> float:
     """终局真值（行棋方视角）：被将死 −1，和棋 0。"""
-    outcome = board.outcome(claim_draw=claim_draw)
+    return _outcome_q(board, fast_outcome(board, claim_draw))
+
+
+def _outcome_q(board: chess.Board, outcome) -> float:
     if outcome is None or outcome.winner is None:
         return 0.0
     return 1.0 if board.turn == outcome.winner else -1.0
@@ -404,25 +424,26 @@ class Gumbel:
                rng: Optional[np.random.Generator] = None, simulations: Optional[int] = None,
                g: Optional[float] = None) -> Think[GumbelResult]:
         cfg = self.cfg
-        if board.is_game_over(claim_draw=cfg.claim_draw):
+        if fast_outcome(board, cfg.claim_draw) is not None:
             return GumbelResult(None, None, {"sims_used": 0})
         if root is None:
             (root,) = yield from self.expander.expand([Leaf(board=board)])
         root_node = node_from_eval(root)
         if root_node.is_terminal:
             return GumbelResult(None, root_node, {"sims_used": 0})
-        root_board = board.copy(stack=True)
+        root_board = copy_board(board)
 
         def expand(parent: Node, action: int) -> Think[Node]:
             mv = parent.moves[action]
             line = parent.line + (mv,)
             depth, path = parent.depth + 1, parent.path + (action,)
-            child_board = root_board.copy(stack=True)
+            child_board = copy_board(root_board)
             for m in line:
                 child_board.push(m)
-            if child_board.is_game_over(claim_draw=cfg.claim_draw):
+            outcome = fast_outcome(child_board, cfg.claim_draw)
+            if outcome is not None:
                 return Node(legal=np.zeros(0, np.int64), logits=np.zeros(0, np.float32),
-                            q=terminal_q(child_board, cfg.claim_draw), depth=depth,
+                            q=_outcome_q(child_board, outcome), depth=depth,
                             action=action, path=path, terminal=True, moves=[], line=line)
             (ev,) = yield from self.expander.expand(
                 [Leaf(board=child_board, parent_handle=parent.handle, move=mv)])
@@ -430,6 +451,7 @@ class Gumbel:
 
         res = yield from order_halving_gen(
             root_node, expand, n_sims=simulations or cfg.simulations, m0=cfg.m0,
-            g=cfg.g if g is None else g, rng=rng, c_visit=cfg.c_visit, c_scale=cfg.c_scale)
+            g=cfg.g if g is None else g, rng=rng, c_visit=cfg.c_visit, c_scale=cfg.c_scale,
+            parallel=cfg.parallel)
         res.pop("tree", None)
         return GumbelResult(root_node.moves[res["action"]], root_node, res)
