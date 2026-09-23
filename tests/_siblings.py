@@ -26,8 +26,8 @@ def load(which: str, *relative: str):
     if not root.is_dir():
         return None
     pkg = PACKAGES[which]
-    prefix = f"{pkg}." if (root / pkg).is_dir() else ""
-    names = [prefix + r for r in relative]
+    # 只有搬进包里的子包才加前缀（R 的 eval/ 等脚本目录仍在仓库根）
+    names = [f"{pkg}.{r}" if (root / pkg / r.split(".")[0]).is_dir() else r for r in relative]
     tops = {n.split(".")[0] for n in names}
     saved_path = list(sys.path)
     saved_mods = {k: sys.modules.pop(k) for k in list(sys.modules) if k.split(".")[0] in tops}

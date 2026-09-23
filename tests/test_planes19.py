@@ -121,5 +121,27 @@ class TestBatchFnEvaluator(unittest.TestCase):
             ev.evaluate([chess.Board(), chess.Board()])
 
 
+class TestFactory(unittest.TestCase):
+    def test_players_share_evaluator(self):
+        ev = FakePlanesEvaluator()
+        f = p19.make_search_player_factory("s", ev, simulations=8, batch_size=4)
+        a, b = f(), f()
+        self.assertIsNot(a, b)
+        self.assertIs(a.expander.evaluator, ev)
+        self.assertIs(f.evaluator, ev)
+        self.assertEqual(a.puct_cfg.simulations, 8)
+
+    def test_missing_resources_raise(self):
+        ev = FakePlanesEvaluator()
+        with self.assertRaises(FileNotFoundError):
+            p19.make_search_player_factory("s", ev, syzygy_path="/no/such/dir")
+        with self.assertRaises(FileNotFoundError):
+            p19.make_search_player_factory("s", ev, book_path="/no/such/book.bin")
+
+    def test_unknown_puct_option_rejected(self):
+        with self.assertRaises(TypeError):
+            p19.make_search_player_factory("s", FakePlanesEvaluator(), c_puct=1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
