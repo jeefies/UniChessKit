@@ -1,6 +1,7 @@
 """从兄弟仓库（R / T）隔离加载模块，用于对照测试。
 
-默认找 kit 同级目录的 ResNet / Transformer，可用环境变量 UNICHESS_R_ROOT / UNICHESS_T_ROOT 覆盖。
+默认找 kit 同级目录的 ResNet / Transformer / SSM，可用环境变量 UNICHESS_R_ROOT / UNICHESS_T_ROOT /
+UNICHESS_S_ROOT 覆盖。S 的包名就是 stateseq（load("S", "stateseq.gumbel")）。
 改名前（core.encoding）与改名后（unichess_r.core.encoding）的模块路径都支持。
 加载完即把引擎的顶层包从 sys.modules 清掉，避免 R/T 同名包互相污染（正是 _import_isolated 想解决的问题）。
 """
@@ -16,8 +17,9 @@ KIT_ROOT = Path(__file__).resolve().parent.parent
 ROOTS = {
     "R": Path(os.environ.get("UNICHESS_R_ROOT", KIT_ROOT.parent / "ResNet")),
     "T": Path(os.environ.get("UNICHESS_T_ROOT", KIT_ROOT.parent / "Transformer")),
+    "S": Path(os.environ.get("UNICHESS_S_ROOT", KIT_ROOT.parent / "SSM")),
 }
-PACKAGES = {"R": "unichess_r", "T": "unichess_t"}
+PACKAGES = {"R": "unichess_r", "T": "unichess_t", "S": "stateseq"}
 
 
 def load(which: str, *relative: str):

@@ -109,11 +109,14 @@ class NodeEval:
 
     moves 为该局面**全部**合法着法（无合法着法时为空，由搜索按终局处理）；
     priors 与 moves 等长、和为 1；value 为当前行棋方视角的标量价值 ∈ [-1, 1]。
+    logits 可选：与 moves 等长的原始 policy logits（fp32）。Gumbel 在 logits 上加噪声与 σ，
+    提供它可避免 log(softmax) 的舍入误差（S 要求与原搜索逐位一致）；PUCT 不用它。
     """
     moves: Sequence[chess.Move]
     priors: Any                              # np.ndarray[float32]
     value: float
     handle: Any = None
+    logits: Any = None
 
 
 class PlayerError(RuntimeError):

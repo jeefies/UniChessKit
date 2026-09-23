@@ -11,7 +11,7 @@ UniChess 各引擎（S / T / R）共享的管线库。引擎只实现少量协�
 | `runtime` | `Batcher`（按 `model_key` 跨局攒批，一模型一拍一次前向）、`CoroutinePool`、`WorkerPool`（spawn；只有显式 done/error 才算结束）、`GpuLease`、`FileLock` |
 | `rules` | `StandardReferee`（`claim_draw=True` 语义，超 `max_plies` 记 truncated）、`OpeningBook`、`TablebaseOracle` |
 | `stats` | Elo±CI、LOS、三项/五项 GSPRT（单一实现） |
-| `search` | `PUCT`：R `search/mcts.py` 的协程化移植，逐节点一致（有 parity 测试） |
+| `search` | `PUCT`：R `search/mcts.py` 的协程化移植，逐节点一致（有 parity 测试）；`Gumbel`：S `stateseq/gumbel.py` 的顺序减半，节点级函数同名同签名（S 的 `test_gumbel` 原样沿用），与 S 逐字节一致（`test_gumbel_parity`），`NodeEval.logits` 提供原始 logits |
 | `players` | `SearchPlayer`（残局表 → 开局库 → 搜索 → 策略）、`RandomPlayer`、`UciPlayer` |
 | `pipelines.match` | 配对换色 + 开局 + SPRT 早停 + JSONL 断点续跑 + 多进程 |
 | `contrib.planes19` | T/R 共用的 19 平面编码与 `Planes19Expander` |
