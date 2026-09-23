@@ -108,6 +108,20 @@ class TestPUCT(unittest.TestCase):
             moves.add(mv)
         self.assertGreater(len(moves), 1)
 
+    def test_root_top_k_limits_sampling(self):
+        for k in (1, 2, 3):
+            picked = set()
+            for seed in range(20):
+                puct, _ = make(sims=60, seed=seed, root_top_k=k)
+                mv, root = run_sync(puct.best_move(chess.Board(), temperature=1.0))
+                top = [root.moves[i] for i in np.argsort(-root.N, kind="stable")[:k]]
+                self.assertIn(mv, top)
+                picked.add(mv)
+            if k == 1:
+                self.assertEqual(len(picked), 1)
+            else:
+                self.assertGreater(len(picked), 1)
+
     def test_tablebase_root_fallback(self):
         board = chess.Board("8/8/8/4k3/8/8/8/R3K3 w - - 0 1")
         oracle = TablebaseOracle(FakeTablebase({"a1a2": (-2, 7)}, default=(0, 3), root=(2, 8)))

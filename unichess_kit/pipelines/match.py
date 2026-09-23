@@ -36,6 +36,7 @@ import chess
 
 from .. import stats
 from ..api.types import GameStart, MoveDecision, PlayerError, SearchBudget
+from ..jsonutil import json_safe
 from ..provenance import collect as collect_provenance
 from ..registry import EngineSpec, build_player_factory
 from ..rules.openings import BUNDLED_OPENINGS, OpeningBook
@@ -127,8 +128,12 @@ def plan_games(cfg: MatchConfig, book: Optional[OpeningBook]) -> list:
 # ------------------------------------------------------------------ 单局协程
 
 def play_game(task: GameTask, player_a, player_b, referee: StandardReferee,
-              budget: SearchBudget):
-    """一局棋的协程，返回结果记录（dict）。结束时（含异常）关闭双方 Player。"""
+              budget: SearchBudget, observer: Optional[Callable[[dict], None]] = None):
+    """一局棋的协程，返回结果记录（dict）。结束时（含异常）关闭双方 Player。
+
+    observer（可选）逐步收到 ``{"type": "game_start"}`` / ``{"type": "move"}`` 事件，
+    用于观战与实时进度；它抛出的异常会中止对局（与 Player 出错同样处理）。
+    """
     t0 = time.perf_counter()
     white, black = (player_a, player_b) if task.a_is_white else (player_b, player_a)
     side_of = {id(player_a): "A", id(player_b): "B"}
@@ -142,11 +147,16 @@ def play_game(task: GameTask, player_a, player_b, referee: StandardReferee,
         yield from player_b.new_game(GameStart(color=not task.a_is_white, seed=task.seed_b,
                                                opening=task.opening, game_id=f"g{task.game}"))
         moves = []
+        if observer is not None:
+            observer({"type": "game_start", "game": task.game, "pair": task.pair,
+                      "white": "A" if task.a_is_white else "B",
+                      "opening": list(task.opening)})
         while True:
             verdict = referee.verdict(board)
             if verdict is not None:
                 break
             mover = white if board.turn == chess.WHITE else black
+            t_move = time.perf_counter()
             decision = yield from mover.choose(board.copy(), budget)
             if not isinstance(decision, MoveDecision):
                 raise PlayerError(f"{mover.name}.choose 应返回 MoveDecision，"
@@ -157,6 +167,12 @@ def play_game(task: GameTask, player_a, player_b, referee: StandardReferee,
             sources[side_of[id(mover)]][decision.source] += 1
             board.push(decision.move)
             moves.append(decision.move.uci())
+            if observer is not None:
+                observer({"type": "move", "game": task.game, "ply": len(board.move_stack),
+                          "uci": decision.move.uci(), "side": side_of[id(mover)],
+                          "source": decision.source,
+                          "ms": int((time.perf_counter() - t_move) * 1000),
+                          "info": json_safe(decision.info) or {}})
             for p in (white, black):
                 yield from p.observe(board.copy(), decision.move)
     finally:
@@ -324,8 +340,11 @@ class _Run:
     """一次评测的共享状态：已完成记录、结果文件、SPRT 停止判定。"""
 
     def __init__(self, cfg: MatchConfig, names: dict, log: Optional[ResultLog],
-                 progress: Optional[Callable]):
+                 progress: Optional[Callable], observer: Optional[Callable] = None,
+                 should_stop: Optional[Callable[[], bool]] = None):
         self.cfg, self.names, self.log, self.progress = cfg, names, log, progress
+        self.observer = observer
+        self.external_stop = should_stop
         self.records: list = []
         self.stopped = False
 
@@ -338,21 +357,25 @@ class _Run:
         if self.progress is not None:
             self.progress(record, self.records)
 
+    def should_stop(self) -> bool:
+        return self.stopped or (self.external_stop is not None and self.external_stop())
+
 
 def _run_local(cfg, tasks, make_a, make_b, run: _Run) -> dict:
     referee = StandardReferee(max_plies=cfg.max_plies)
     budget = SearchBudget(simulations=cfg.simulations)
     batcher = Batcher()
     pool = CoroutinePool(cfg.concurrency, batcher)
-    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), referee, budget)))
+    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), referee, budget,
+                                            run.observer)))
             for t in tasks)
-    pool.run(jobs, lambda _gid, rec: run.add(rec), should_stop=lambda: run.stopped)
+    pool.run(jobs, lambda _gid, rec: run.add(rec), should_stop=run.should_stop)
     return batcher.stats.as_dict()
 
 
 def _match_worker(wid, task, emit, stop_event):
     """WorkerPool 的 worker：在子进程里加载双方引擎，跑分到的局。"""
-    cfg_d, spec_a, spec_b, tasks = task
+    cfg_d, spec_a, spec_b, tasks, observe = task
     cfg = MatchConfig.from_dict(cfg_d)
     make_a = build_player_factory(EngineSpec.from_dict(spec_a))
     make_b = build_player_factory(EngineSpec.from_dict(spec_b))
@@ -360,7 +383,8 @@ def _match_worker(wid, task, emit, stop_event):
     budget = SearchBudget(simulations=cfg.simulations)
     batcher = Batcher()
     pool = CoroutinePool(cfg.concurrency, batcher)
-    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), referee, budget)))
+    observer = (lambda ev: emit({"type": "event", "event": ev})) if observe else None
+    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), referee, budget, observer)))
             for t in tasks)
     pool.run(jobs, lambda _gid, rec: emit(rec), should_stop=stop_event.is_set)
     emit({"type": "batch_stats", **batcher.stats.as_dict()})
@@ -369,10 +393,14 @@ def _match_worker(wid, task, emit, stop_event):
 def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
               spec_b: Optional[EngineSpec] = None, make_a: Optional[Callable] = None,
               make_b: Optional[Callable] = None, out_path=None,
-              names: Optional[dict] = None, progress: Optional[Callable] = None) -> dict:
+              names: Optional[dict] = None, progress: Optional[Callable] = None,
+              observer: Optional[Callable[[dict], None]] = None,
+              should_stop: Optional[Callable[[], bool]] = None) -> dict:
     """跑一次评测，返回汇总（同时写入 out_path 与 <out_path>.summary.json）。
 
     两种用法：给 EngineSpec（可多进程），或直接给 PlayerFactory（仅单进程，测试 / 嵌入用）。
+    observer 收到逐步事件（见 play_game；多进程时经 worker 转发）；should_stop 返回真后
+    不再开新局，已开局的下完入库。
     """
     if (spec_a is None) != (spec_b is None) or (make_a is None) != (make_b is None) \
             or (spec_a is None) == (make_a is None):
@@ -393,7 +421,7 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
               "provenance": collect_provenance(
                   {"A": spec_a.root, "B": spec_b.root} if spec_a is not None else None)}
     log = ResultLog(out_path, header) if out_path is not None else None
-    run = _Run(cfg, names, log, progress)
+    run = _Run(cfg, names, log, progress, observer, should_stop)
     t0 = time.perf_counter()
     batch_stats: dict = {}
     try:
@@ -405,7 +433,7 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
                 print(f"[match] 续跑：已完成 {len(done)} 局", file=sys.stderr)
             tasks = [t for t in tasks if t.game not in done]
             run.stopped = _sprt_decided(run.records, cfg)
-        if tasks and not run.stopped:
+        if tasks and not run.should_stop():
             if cfg.workers == 1:
                 if make_a is None:
                     make_a, make_b = build_player_factory(spec_a), build_player_factory(spec_b)
@@ -434,12 +462,17 @@ def _run_workers(cfg, tasks, spec_a, spec_b, run: _Run) -> dict:
     def on_result(_wid, obj):
         if obj.get("type") == "batch_stats":
             totals.update({k: v for k, v in obj.items() if k != "type"})
+        elif obj.get("type") == "event":
+            if run.observer is not None:
+                run.observer(obj["event"])
         else:
             run.add(obj)
 
+    observe = run.observer is not None
     WorkerPool().run(_match_worker,
-                     [(cfg.to_dict(), spec_a.to_dict(), spec_b.to_dict(), s) for s in shards],
-                     on_result, should_stop=lambda: run.stopped)
+                     [(cfg.to_dict(), spec_a.to_dict(), spec_b.to_dict(), s, observe)
+                      for s in shards],
+                     on_result, should_stop=run.should_stop)
     return dict(totals)
 
 

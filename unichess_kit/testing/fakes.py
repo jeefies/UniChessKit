@@ -112,3 +112,58 @@ def ok_worker(wid, task, emit, stop_event):
 def error_worker(wid, task, emit, stop_event):
     emit({"wid": wid})
     raise ValueError(f"worker {wid} 故意失败")
+
+
+def make_slow_player_factory(delay_s: float = 0.2, name: str = "slow"):
+    """每步 sleep delay_s 的随机 Player（测试 job 的停止与实时快照）。"""
+    import time as _time
+
+    from ..players import RandomPlayer
+
+    class _Slow(RandomPlayer):
+        def choose(self, board, budget):
+            _time.sleep(delay_s)
+            return super().choose(board, budget)
+
+    return lambda: _Slow(name)
+
+
+class FakeGameEngine:
+    """六方法 GameEngine 的最小实现（总走 UCI 字典序第一个合法着法），测试 serving 适配用。"""
+
+    IMPLEMENTED = True
+    instances: list = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.board = chess.Board()
+        self.cleaned = 0
+        self.calls: list = []
+        FakeGameEngine.instances.append(self)
+
+    def setup(self, fen=None):
+        self.calls.append(("setup", fen))
+        self.board = chess.Board(fen) if fen else chess.Board()
+        return self.state()
+
+    def human_move(self, uci):
+        self.calls.append(("human_move", uci))
+        self.board.push_uci(uci)
+        return self.state()
+
+    def engine_move(self):
+        self.calls.append(("engine_move",))
+        mv = sorted(self.board.legal_moves, key=lambda m: m.uci())[0]
+        self.board.push(mv)
+        return {"engine_move": mv.uci(), "fen": self.board.fen(), "done": False,
+                "eval": np.float32(0.25), "nodes": np.int64(7)}
+
+    def state(self):
+        return {"fen": self.board.fen(), "done": self.board.is_game_over()}
+
+    def undo(self):
+        self.board.pop()
+        return self.state()
+
+    def cleanup(self):
+        self.cleaned += 1

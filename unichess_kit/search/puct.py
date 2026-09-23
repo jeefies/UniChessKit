@@ -45,6 +45,7 @@ class PUCTConfig:
     claim_draw: bool = False        # 搜索内是否把「可申和」当作和棋终局（R 默认关）
     max_collision: int = 8          # 一批里同一叶子最多被选中几次
     root_min_visits: int = 1
+    root_top_k: int = 0             # 温度采样只在访问数前 K 的根着法里进行（0 = 不限）
 
 
 class Node:
@@ -315,10 +316,14 @@ class PUCT:
         if t <= 0:
             i = int(np.argmax(root.N))
         else:
-            counts = root.N.astype(np.float64) ** (1.0 / t)
+            # 只在访问数前 K 的着法里采样：T 实测不限范围的温度采样会选到排名很差的着法
+            k = int(self.cfg.root_top_k)
+            idx = (np.argsort(-root.N, kind="stable")[:k] if k > 0
+                   else np.arange(len(root.N)))
+            counts = root.N[idx].astype(np.float64) ** (1.0 / t)
             s = counts.sum()
-            i = int(np.argmax(root.N)) if s <= 0 else int(self.rng.choice(len(counts),
-                                                                          p=counts / s))
+            i = (int(np.argmax(root.N)) if s <= 0 or k == 1
+                 else int(idx[self.rng.choice(len(counts), p=counts / s)]))
         return root.moves[i], root
 
     def _tablebase_root_move(self, board: chess.Board, legal) -> Optional[chess.Move]:

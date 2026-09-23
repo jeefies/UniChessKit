@@ -61,14 +61,18 @@ class MoveDecision:
 
 @dataclass(frozen=True)
 class GameStart:
-    """开局信息。opening 是从标准初始局面出发、已经走完的开局着法（UCI）。"""
+    """开局信息。opening 是从起始局面出发、已经走完的开局着法（UCI）。
+
+    起始局面默认是标准初始局面；fen 非空时从该局面开始（Server 的自定义局面对局）。
+    """
     color: bool                              # 本 Player 执哪方（chess.WHITE / BLACK）
     seed: int = 0
     opening: tuple = ()
     game_id: str = ""
+    fen: Optional[str] = None
 
     def board(self) -> chess.Board:
-        b = chess.Board()
+        b = chess.Board(self.fen) if self.fen else chess.Board()
         for uci in self.opening:
             b.push_uci(uci)
         return b
