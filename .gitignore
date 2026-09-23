@@ -1,0 +1,38 @@
+# 运行时产物（结果、日志、权重、数据分片一律不入库）
+/runs/
+/data/
+logs/
+*.jsonl
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.zst
+*.bin
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 隐私：AI 会话导出、密钥、token
+session-*.md
+kimi-export-*.md
+claude-history/
+.env
+*.known_hosts
+id_rsa*
+id_ed25519*
+
+# 第三方二进制
+stockfish*
+
+# 备份文件
+*.orig
+*.bak
+*.before-*
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
