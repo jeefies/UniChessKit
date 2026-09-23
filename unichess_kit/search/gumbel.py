@@ -89,6 +89,10 @@ class Node:
     moves: Optional[list] = None
     line: tuple = ()
     handle: Any = None
+    # softmax(logits) 缓存（select_action 快路径用；logits 构造后不再改写）
+    pi_cache: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    # 本节点局面（``Gumbel`` 用：子局面 = 复制父局面 + 走一步，免得每次从根重放整条 line）
+    board: Optional[chess.Board] = field(default=None, repr=False, compare=False)
 
     @property
     def is_terminal(self) -> bool:
@@ -174,7 +178,45 @@ def pi_prime(node: Node, c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> 
 
 
 def select_action(node: Node, c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> int:
-    """非根确定性选择：a* = argmax[π_imp − N/(1+ΣN)]。"""
+    """非根确定性选择：a* = argmax[π_imp − N/(1+ΣN)]。
+
+    热路径（每次模拟每层一次）：与 ``_select_action_ref``（逐函数组合的参考写法）逐位相同——
+    同样的算式、dtype 与次序，只是 softmax(ℓ)、已访问边的 q、ΣN 各算一次（π 按节点缓存）。
+    ``tests/test_gumbel_fastpath.py`` 随机节点对照。
+    """
+    if node.terminal or node.logits.size == 0:
+        return _select_action_ref(node, c_visit, c_scale)
+    pi = node.pi_cache
+    if pi is None:
+        pi = node.pi_cache = softmax(node.logits)
+    n = node.n
+    n_total = int(n.sum()) if n.size else 0
+    if n_total == 0:
+        # completed Q 全 = v̂ ⇒ q̂ ≡ +0、σ ≡ +0，ℓ + 0 = ℓ ⇒ π_imp = softmax(ℓ)；frac ≡ 0
+        pi_imp = pi
+        if n.size == 0:
+            return int(node.legal[np.argmax(pi_imp)])
+        return int(node.legal[np.argmax(pi_imp - n.astype(np.float32) / np.float32(1))])
+    visited = np.flatnonzero(n > 0)
+    qv = node.q_sum[visited] / n[visited].astype(np.float32)
+    pv = pi[visited]
+    num = float(np.dot(pv, qv))
+    den = float(pv.sum()) + EPS
+    n_tot = float(n_total)
+    vm = (float(node.q) + n_tot * (num / den)) / (1.0 + n_tot)
+    cq = np.full(len(node.legal), vm, np.float32)
+    cq[visited] = qv
+    q_min, q_max = float(cq.min()), float(cq.max())
+    span = q_max - q_min + EPS
+    q_hat = (cq - np.float32(q_min)) / np.float32(span)
+    s = (c_visit + np.asarray(int(n.max()), dtype=np.float32)) * c_scale * q_hat
+    pi_imp = softmax(node.logits + s)
+    frac = n.astype(np.float32) / np.float32(1 + n_total)
+    return int(node.legal[np.argmax(pi_imp - frac)])
+
+
+def _select_action_ref(node: Node, c_visit: float = C_VISIT, c_scale: float = C_SCALE) -> int:
+    """``select_action`` 的参考写法（逐函数组合；对照测试用）。"""
     pi_imp = improved_policy(node, c_visit, c_scale)
     if node.n.size == 0:
         return int(node.legal[np.argmax(pi_imp)])
@@ -431,15 +473,14 @@ class Gumbel:
         root_node = node_from_eval(root)
         if root_node.is_terminal:
             return GumbelResult(None, root_node, {"sims_used": 0})
-        root_board = copy_board(board)
+        root_node.board = copy_board(board)
 
         def expand(parent: Node, action: int) -> Think[Node]:
             mv = parent.moves[action]
             line = parent.line + (mv,)
             depth, path = parent.depth + 1, parent.path + (action,)
-            child_board = copy_board(root_board)
-            for m in line:
-                child_board.push(m)
+            child_board = copy_board(parent.board)
+            child_board.push(mv)
             outcome = fast_outcome(child_board, cfg.claim_draw)
             if outcome is not None:
                 return Node(legal=np.zeros(0, np.int64), logits=np.zeros(0, np.float32),
@@ -447,7 +488,9 @@ class Gumbel:
                             action=action, path=path, terminal=True, moves=[], line=line)
             (ev,) = yield from self.expander.expand(
                 [Leaf(board=child_board, parent_handle=parent.handle, move=mv)])
-            return node_from_eval(ev, depth=depth, action=action, path=path, line=line)
+            node = node_from_eval(ev, depth=depth, action=action, path=path, line=line)
+            node.board = child_board
+            return node
 
         res = yield from order_halving_gen(
             root_node, expand, n_sims=simulations or cfg.simulations, m0=cfg.m0,
