@@ -57,6 +57,18 @@ class TestPlan(unittest.TestCase):
         cfg = MatchConfig.from_dict({"pairs": 2, "sprt": {"elo1": 20}})
         self.assertEqual(cfg.sprt.elo1, 20)
 
+    def test_max_plies_after_opening(self):
+        from unichess_kit.pipelines.match import load_book
+        whole = MatchConfig(pairs=3, max_plies=10)
+        after = MatchConfig(pairs=3, max_plies=10, max_plies_after_opening=True)
+        for t in plan_games(after, load_book("bundled")):
+            self.assertEqual(whole.referee(t).max_plies, 10)
+            self.assertEqual(after.referee(t).max_plies, 10 + len(t.opening))
+        # 默认值不进 to_dict：既有结果文件的配置哈希保持不变
+        self.assertNotIn("max_plies_after_opening", whole.to_dict())
+        self.assertTrue(after.to_dict()["max_plies_after_opening"])
+        self.assertEqual(MatchConfig.from_dict(after.to_dict()), after)
+
 
 class TestMatch(Base):
     def run_fake(self, out=None, pairs=3, **kw):
@@ -84,6 +96,19 @@ class TestMatch(Base):
                 self.assertEqual(g["plies"], 60)
         self.assertTrue(Path(str(out) + ".summary.json").exists())
         self.assertEqual(s["games_planned"], 6)
+
+    def test_truncation_counts_only_after_opening(self):
+        s = self.run_fake(pairs=2, max_plies_after_opening=True)
+        self.assertGreater(s["games"], 0)
+        out = self.dir / "t.jsonl"
+        cfg = MatchConfig(pairs=2, max_plies=3, concurrency=2, max_plies_after_opening=True)
+        run_match(cfg, make_a=make_random_player_factory("a"), make_b=make_random_player_factory("b"),
+                  out_path=out)
+        _, games = read_games(out)
+        for r in games:
+            self.assertEqual(r["termination"], "truncated")
+            self.assertEqual(len(r["moves"]), 3)
+            self.assertEqual(r["plies"], len(r["opening"]) + 3)
 
     def test_reproducible(self):
         a = self.dir / "a.jsonl"

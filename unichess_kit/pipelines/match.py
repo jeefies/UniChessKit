@@ -66,6 +66,8 @@ class MatchConfig:
     simulations: Optional[int] = None       # 覆盖双方 Player 的默认模拟数；None = 各用各的
     sprt: Optional[SprtConfig] = None
     workers: int = 1
+    # True：max_plies 只计开局之后的 ply（S arena 口径）；默认按整盘计（含开局）
+    max_plies_after_opening: bool = False
 
     def __post_init__(self):
         if self.pairs < 1:
@@ -85,7 +87,14 @@ class MatchConfig:
         return cls(**d)
 
     def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
+        d = dataclasses.asdict(self)
+        if not d["max_plies_after_opening"]:   # 默认值不入字典：既有结果文件的配置哈希不变
+            del d["max_plies_after_opening"]
+        return d
+
+    def referee(self, task: "GameTask") -> StandardReferee:
+        extra = len(task.opening) if self.max_plies_after_opening else 0
+        return StandardReferee(max_plies=self.max_plies + extra)
 
 
 # ------------------------------------------------------------------ 对局计划
@@ -365,11 +374,10 @@ class _Run:
 
 
 def _run_local(cfg, tasks, make_a, make_b, run: _Run) -> dict:
-    referee = StandardReferee(max_plies=cfg.max_plies)
     budget = SearchBudget(simulations=cfg.simulations)
     batcher = Batcher()
     pool = CoroutinePool(cfg.concurrency, batcher)
-    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), referee, budget,
+    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), cfg.referee(t), budget,
                                             run.observer)))
             for t in tasks)
     pool.run(jobs, lambda _gid, rec: run.add(rec), should_stop=run.should_stop)
@@ -382,12 +390,12 @@ def _match_worker(wid, task, emit, stop_event):
     cfg = MatchConfig.from_dict(cfg_d)
     make_a = build_player_factory(EngineSpec.from_dict(spec_a))
     make_b = build_player_factory(EngineSpec.from_dict(spec_b))
-    referee = StandardReferee(max_plies=cfg.max_plies)
     budget = SearchBudget(simulations=cfg.simulations)
     batcher = Batcher()
     pool = CoroutinePool(cfg.concurrency, batcher)
     observer = (lambda ev: emit({"type": "event", "event": ev})) if observe else None
-    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), referee, budget, observer)))
+    jobs = ((t.game, (lambda t=t: play_game(t, make_a(), make_b(), cfg.referee(t), budget,
+                                            observer)))
             for t in tasks)
     pool.run(jobs, lambda _gid, rec: emit(rec), should_stop=stop_event.is_set)
     emit({"type": "batch_stats", **batcher.stats.as_dict()})
