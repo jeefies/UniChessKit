@@ -13,4 +13,4 @@ dependencies = ["chess>=1.9", "numpy>=1.24"]
 include = ["unichess_kit*"]
 
 [tool.setuptools.package-data]
-unichess_kit = ["data/*.txt"]
+unichess_kit = ["data/*.txt", "search/_native/*.cpp"]

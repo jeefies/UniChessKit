@@ -13,6 +13,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 build/
+*.so
 dist/
 
 # 隐私：AI 会话导出、密钥、token

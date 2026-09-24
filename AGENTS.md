@@ -19,6 +19,8 @@ S/T/R 共享的管线库。设计与分阶段计划：`~/.claude/plans/s-ply-daz
 - 续跑拒绝配置哈希不同的结果文件；中间行损坏报错，末尾半行丢弃。
 - 配置哈希只用 `EngineSpec.identity()`（不含 `runtime`）；会改变结果的参数必须放 `kwargs`——`test_registry`。
 - `PUCT` 与 R `search/mcts.py` 逐节点一致（parity 测试），改搜索先让 parity 失败有理由。
+- `PUCTCpp` 与 `PUCT` 整树逐位一致——`test_puct_cpp`（棋规对照 python-chess 的着法**顺序**、搜索整树对照、整局对照）。
+  改 `PUCT` 必须同步改 `_native/puct_native.cpp`，否则 parity 测试会失败；C++ 编译失败必须报错，不得回退 Python。
 
 ## 开发
 

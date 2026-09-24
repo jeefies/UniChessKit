@@ -1,4 +1,4 @@
-# UniChessKit
+`PUCTCpp`：同一算法的 C++ 实现（见下），与 `PUCT` 整树逐位一致；# UniChessKit
 
 UniChess 各引擎（S / T / R）共享的管线库。引擎只实现少量协议，对弈、搜索、裁决、统计由本库统一提供，
 避免同一类 bug 在多个仓库里反复出现。
@@ -84,6 +84,24 @@ python -m unichess_kit.jobs <job_dir>      # job_dir/job.json 描述任务
 可用量 = 总显存 − 512 MiB 余量 − 非租约进程占用 − Σ 各存活租约的 max(预算, 实际占用)；不够就抛 `GpuBusyError`
 （训练进程占卡时 job 直接以 `gpu_busy` 结束，不排队）。进程死掉锁自动释放，残留的 `.lease` 文件下次申请时清理。
 没有 `nvidia-smi` 的机器上总是批准。
+
+## C++ PUCT（`search/puct_cpp.py`）
+
+`PUCT` 的下探、棋规、19 平面编码、回传全部搬进 C++（`search/_native/puct_native.cpp`，ctypes 调用、期间释放 GIL），
+Python 只剩调度：`collect`（C++ 选叶子并直接写出编码）→ `yield EvalRequest` → `apply`（C++ 算先验、展开、回传）。
+
+- **逐位一致**：同一评估器下整棵树（moves / P / N / W / VL / sum_N / 终局值）与 `last_metrics` 都和 `PUCT` 相同
+  （`tests/test_puct_cpp.py`）。为此 C++ 复刻了 python-chess 1.11 的合法着法顺序、`is_repetition` 回退、终局判定顺序，
+  以及 numpy 2 的类型提升与 pairwise 求和；编译带 `-ffp-contract=off`（不合并 FMA）。
+- **残局表**仍在 Python：叶子子力 <= `oracle.max_pieces` 时 C++ 暂停，把路径交回，Python 在原棋盘（含走子栈）上重放后探测、回填。
+- **编译**：首次使用时 `g++` 编译，按源码 + 编译选项哈希缓存到 `~/.cache/unichess_kit/native/`（`UNICHESS_KIT_NATIVE_CACHE` 可改）；
+  编译失败直接报错，不静默回退 Python（T 的 C++ MCTS 曾静默回退，见 T `5f81219`）。
+- **接入**：`make_search_player_factory(..., planes_evaluator=..., search_impl="auto")`，`planes_evaluator` 的负载是
+  `(19, 8, 8) float32`；T/R 的 `kit_adapter` 已提供（`engine.evaluate_planes`），默认走 C++。
+  `search_impl="python"` 切回 Python 版对照——结果相同，放在 `runtime` 里不改配置哈希。
+- **实测**（5070 Ti，P1 验收口径：T strat-p4 vs R stage1，各 200 模拟，32 对 64 局，concurrency 16）：
+  Python 685 s → C++ 77 s（8.9×）；两边 64/64 局逐字节一致，批次计数（ticks / forwards / positions）也相同，
+  与 P1 结果一致（T +11 =53 −0，Elo +60）。
 
 ## Serving（Server 六方法契约）
 

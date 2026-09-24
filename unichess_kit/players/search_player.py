@@ -36,7 +36,8 @@ def open_polyglot(path):
 class SearchPlayer:
     def __init__(self, name: str, expander, *, simulations: int = 0,
                  puct: Optional[PUCTConfig] = None, oracle=None, book=None,
-                 book_plies: int = 10, temperature: float = 0.0, reuse_tree: bool = True):
+                 book_plies: int = 10, temperature: float = 0.0, reuse_tree: bool = True,
+                 planes_evaluator=None):
         self.name = name
         self.expander = expander
         self.simulations = simulations
@@ -46,6 +47,7 @@ class SearchPlayer:
         self.book_plies = book_plies
         self.temperature = temperature
         self.reuse_tree = reuse_tree
+        self.planes_evaluator = planes_evaluator    # 给出时用 C++ PUCT（search/puct_cpp.py）
         self.new_game_called = False
         self._reset(0)
 
@@ -54,7 +56,12 @@ class SearchPlayer:
     def _reset(self, seed: int) -> None:
         self.rng = random.Random(seed)
         self.np_rng = np.random.default_rng(seed)
-        self.search = PUCT(self.expander, self.puct_cfg, oracle=self.oracle, rng=self.np_rng)
+        if self.planes_evaluator is not None:
+            from ..search.puct_cpp import PUCTCpp
+            self.search = PUCTCpp(self.planes_evaluator, self.puct_cfg, oracle=self.oracle,
+                                  rng=self.np_rng, expander=self.expander)
+        else:
+            self.search = PUCT(self.expander, self.puct_cfg, oracle=self.oracle, rng=self.np_rng)
         self._root, self._root_ply, self._root_epd = None, -1, None
         self.last_info: dict = {}
 
@@ -158,7 +165,7 @@ class SearchPlayer:
         if probe.epd() != epd:
             return None
         for mv in board.move_stack[ply:]:
-            root = PUCT.advance_root(root, mv)
+            root = self.search.advance_root(root, mv)
             if root is None:
                 return None
         return root
@@ -172,5 +179,5 @@ class SearchPlayer:
             i = int(np.argmax(root.N))
             if root.N[i] > 0:
                 info["q"] = float(root.W[i]) / float(root.N[i])
-            info["pv"] = [mv.uci() for mv in PUCT.principal_variation(root)]
+            info["pv"] = [mv.uci() for mv in self.search.principal_variation(root)]
         return info

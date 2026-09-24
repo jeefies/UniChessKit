@@ -51,6 +51,54 @@ class FakePlanesEvaluator:
         return [self._one(b) for b in payloads]
 
 
+class FakePlanes19Model:
+    """只看 19 平面编码的假模型：``evaluate_batch(boards)`` 与 ``evaluate_planes(xs)`` 对同一局面
+    给出逐位相同的结果（前者 = 编码 + 后者），用来对照 Python PUCT 与 C++ PUCT。
+
+    quantize > 0 时策略量化到 quantize 档、价值量化到 5 档，制造大量并列（考 argmax 取第一个）。
+    """
+
+    def __init__(self, salt: str = "", quantize: int = 0):
+        self.salt = salt.encode()
+        self.quantize = quantize
+
+    def _one(self, x: np.ndarray):
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        rng = np.random.default_rng(zlib.crc32(self.salt + x.tobytes()))
+        policy = rng.random(POLICY_SIZE).astype(np.float32) ** 4
+        if self.quantize:
+            policy = np.floor(policy * self.quantize).astype(np.float32) + np.float32(1)
+        policy /= policy.sum()
+        promo = np.array([0.7, 0.1, 0.1, 0.1], dtype=np.float32)
+        weights = np.array([1, 3, 3, 5, 9, 0], dtype=np.float32)
+        diff = float((x[0:6].sum(axis=(1, 2)) * weights).sum()
+                     - (x[6:12].sum(axis=(1, 2)) * weights).sum())
+        diff += float(rng.standard_normal()) * 0.5
+        if self.quantize:
+            diff = float(np.round(diff))
+        win = 1.0 / (1.0 + np.exp(-diff / 3.0))
+        if self.quantize:
+            win = round(win * 4) / 4
+        wdl = np.array([win * 0.8, 0.2, (1 - win) * 0.8], dtype=np.float32)
+        return policy, promo, wdl
+
+    def evaluate_planes(self, xs):
+        outs = [self._one(x) for x in xs]
+        return (np.stack([o[0] for o in outs]), np.stack([o[1] for o in outs]),
+                np.stack([o[2] for o in outs]))
+
+    def evaluate_batch(self, boards):
+        from ..contrib.planes19 import encode
+        return self.evaluate_planes([encode(b) for b in boards])
+
+    def evaluators(self, max_batch=None):
+        """(棋盘评估器, 编码评估器)，与 T/R kit_adapter 的包装方式相同。"""
+        from ..contrib.planes19 import BatchFnEvaluator
+        key = f"fake19:{self.salt.decode()}:{self.quantize}"
+        return (BatchFnEvaluator(key, self.evaluate_batch, max_batch),
+                BatchFnEvaluator(key + ":planes", self.evaluate_planes, max_batch))
+
+
 class _FakeFactory:
     def __init__(self, name, evaluator, simulations, batch_size, temperature):
         self.name = name

@@ -305,7 +305,7 @@ class PUCT:
                 if mv is not None:
                     return mv, root
                 # 根节点的残局表缺子节点 DTZ：绝不随便挑一步，改为关掉残局表重搜
-                fallback = PUCT(self.expander, self.cfg, oracle=None, rng=self.rng)
+                fallback = self._without_oracle()
                 result = yield from fallback.best_move(board, simulations, temperature,
                                                        add_noise)
                 self.last_metrics = fallback.last_metrics
@@ -325,6 +325,9 @@ class PUCT:
             i = (int(np.argmax(root.N)) if s <= 0 or k == 1
                  else int(idx[self.rng.choice(len(counts), p=counts / s)]))
         return root.moves[i], root
+
+    def _without_oracle(self) -> "PUCT":
+        return PUCT(self.expander, self.cfg, oracle=None, rng=self.rng)
 
     def _tablebase_root_move(self, board: chess.Board, legal) -> Optional[chess.Move]:
         """根节点已由残局表定值时的选着（R search/mcts.py best_move 的回退分支）。"""
