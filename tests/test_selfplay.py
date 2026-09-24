@@ -8,8 +8,8 @@ import unittest
 import chess
 import numpy as np
 
-from unichess_kit.api import EvalRequest, MoveDecision, PlayerError, immediate
-from unichess_kit.pipelines.selfplay import (SelfPlayConfig, game_seed_sequence, load_book_lines,
+from Kit.api import EvalRequest, MoveDecision, PlayerError, immediate
+from Kit.pipelines.selfplay import (SelfPlayConfig, game_seed_sequence, load_book_lines,
                                              plan_selfplay, run_selfplay)
 
 

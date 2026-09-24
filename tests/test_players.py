@@ -3,14 +3,14 @@ from collections import namedtuple
 
 import chess
 
-from unichess_kit.api import GameStart, SearchBudget
-from unichess_kit.contrib.planes19 import Planes19Expander
-from unichess_kit.players import RandomPlayer, SearchPlayer
-from unichess_kit.rules import TablebaseOracle
-from unichess_kit.runtime import run_sync
-from unichess_kit.search import PUCTConfig
-from unichess_kit.testing import FakePlanesEvaluator, PlayerContract
-from tests.test_rules import FakeTablebase
+from Kit.api import GameStart, SearchBudget
+from Kit.planes19 import Planes19Expander
+from Kit.players import RandomPlayer, SearchPlayer
+from Kit.rules import TablebaseOracle
+from Kit.runtime import run_sync
+from Kit.search import PUCTConfig
+from Kit.testing import FakePlanesEvaluator, PlayerContract
+from Kit.tests.test_rules import FakeTablebase
 
 
 def search_player(sims=24, **kw):

@@ -9,7 +9,7 @@ import unittest
 
 import numpy as np
 
-from unichess_kit.search.gumbel import (
+from Kit.search.gumbel import (
     C_SCALE,
     C_VISIT,
     EPS,

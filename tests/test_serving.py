@@ -2,11 +2,11 @@ import unittest
 
 import chess
 
-from unichess_kit.api import GameStart, SearchBudget
-from unichess_kit.runtime import run_sync
-from unichess_kit.serving import GameEnginePlayer, make_game_engine
-from unichess_kit.testing import PlayerContract, make_fake_player_factory
-from unichess_kit.testing.fakes import FakeGameEngine
+from Kit.api import GameStart, SearchBudget
+from Kit.runtime import run_sync
+from Kit.serving import GameEnginePlayer, make_game_engine
+from Kit.testing import PlayerContract, make_fake_player_factory
+from Kit.testing.fakes import FakeGameEngine
 
 LOADS = []
 

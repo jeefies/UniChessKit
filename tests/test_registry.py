@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from unichess_kit.registry import EngineSpec, RegistryError, build_player_factory, load_object
+from Kit.registry import EngineSpec, RegistryError, build_player_factory, load_object
 
 
 class TestRegistry(unittest.TestCase):

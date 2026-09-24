@@ -4,14 +4,14 @@ import unittest
 import chess
 import numpy as np
 
-from unichess_kit.api import EvalRequest
-from unichess_kit.contrib.planes19 import Planes19Expander
-from unichess_kit.rules import TablebaseOracle
-from unichess_kit.runtime import run_sync
-from unichess_kit.search import PUCT, PUCTConfig
-from unichess_kit.testing import FakePlanesEvaluator
-from tests import _siblings
-from tests.test_rules import FakeTablebase
+from Kit.api import EvalRequest
+from Kit.planes19 import Planes19Expander
+from Kit.rules import TablebaseOracle
+from Kit.runtime import run_sync
+from Kit.search import PUCT, PUCTConfig
+from Kit.testing import FakePlanesEvaluator
+from Kit.tests import golden
+from Kit.tests.test_rules import FakeTablebase
 
 POSITIONS = (
     chess.STARTING_FEN,
@@ -146,68 +146,43 @@ class TestPUCT(unittest.TestCase):
 
 
 class TestParityWithR(unittest.TestCase):
-    """kit PUCT 与 R search/mcts.py 在同一评估器下逐节点一致。"""
+    """kit PUCT 与旧 R ``search/mcts.py`` 的冻结整树（tests/fixtures/r_mcts）逐节点一致。"""
 
     @classmethod
     def setUpClass(cls):
-        mods = _siblings.load("R", "search.mcts")
-        if mods is None:
-            raise unittest.SkipTest("找不到 R 仓库（设置 UNICHESS_R_ROOT）")
-        cls.r = mods[0]
+        cls.g = golden.load("r_mcts")
 
-    def pair(self, sims, batch, seed=0, **kw):
-        r_ev, k_ev = FakePlanesEvaluator("r"), FakePlanesEvaluator("k")
-        r = self.r.MCTS(r_ev.evaluate_batch, self.r.MCTSConfig(simulations=sims, batch_size=batch,
-                                                               **kw),
-                        rng=np.random.default_rng(seed))
-        k = PUCT(Planes19Expander(k_ev), PUCTConfig(simulations=sims, batch_size=batch, **kw),
-                 rng=np.random.default_rng(seed))
-        return r, k
-
-    def assert_same_tree(self, a, b, depth=2):
-        self.assertEqual(a.moves, b.moves)
-        np.testing.assert_array_equal(a.N, b.N)
-        np.testing.assert_array_equal(a.W, b.W)
-        np.testing.assert_array_equal(a.P, b.P)
-        self.assertEqual(a.terminal_value, b.terminal_value)
-        if depth > 0:
-            for ca, cb in zip(a.children, b.children):
-                self.assertEqual(ca is None, cb is None)
-                if ca is not None:
-                    self.assert_same_tree(ca, cb, depth - 1)
+    def make(self, sims, batch, seed=0, **kw):
+        return PUCT(Planes19Expander(FakePlanesEvaluator("k")),
+                    PUCTConfig(simulations=sims, batch_size=batch, **kw),
+                    rng=np.random.default_rng(seed))
 
     def test_same_tree_and_move(self):
-        for fen in POSITIONS:
-            for sims, batch in ((64, 8), (257, 32), (400, 128)):
-                r, k = self.pair(sims, batch)
-                board = chess.Board(fen)
-                rm, rroot = r.best_move(board.copy())
-                km, kroot = run_sync(k.best_move(board.copy()))
-                self.assertEqual(rm, km, fen)
-                self.assert_same_tree(rroot, kroot)
-                for key in ("simulations", "network_positions", "network_batches", "max_depth",
-                            "collisions"):
-                    self.assertEqual(r.last_metrics[key], k.last_metrics[key], (fen, key))
+        self.assertEqual(len(self.g["cases"]), len(POSITIONS) * 3)
+        for case in self.g["cases"]:
+            k = self.make(case["sims"], case["batch"])
+            km, kroot = run_sync(k.best_move(chess.Board(case["fen"])))
+            self.assertEqual(km.uci(), case["move"], case["fen"])
+            golden.assert_tree(self, kroot, case["tree"])
+            for key, v in case["metrics"].items():
+                self.assertEqual(k.last_metrics[key], v, (case["fen"], key))
 
     def test_same_with_noise_and_temperature(self):
-        r, k = self.pair(120, 16, seed=9, temperature=1.0)
-        board = chess.Board(POSITIONS[4])
-        rm, rroot = r.best_move(board.copy(), add_noise=True)
-        km, kroot = run_sync(k.best_move(board.copy(), add_noise=True))
-        self.assertEqual(rm, km)
-        self.assert_same_tree(rroot, kroot, depth=1)
+        c = self.g["noise"]
+        k = self.make(c["sims"], c["batch"], seed=c["seed"], temperature=c["temperature"])
+        km, kroot = run_sync(k.best_move(chess.Board(c["fen"]), add_noise=True))
+        self.assertEqual(km.uci(), c["move"])
+        golden.assert_tree(self, kroot, c["tree"])
 
     def test_same_with_tree_reuse_over_a_game(self):
-        r, k = self.pair(96, 16)
-        board = chess.Board()
-        rroot = kroot = None
-        for _ in range(10):
-            rm, rroot = r.best_move(board.copy(), root=rroot)
+        c = self.g["reuse"]
+        k = self.make(c["sims"], c["batch"])
+        board, kroot = chess.Board(), None
+        for step in c["steps"]:
             km, kroot = run_sync(k.best_move(board.copy(), root=kroot))
-            self.assertEqual(rm, km, board.fen())
-            self.assert_same_tree(rroot, kroot, depth=1)
-            board.push(rm)
-            rroot = self.r.MCTS.advance_root(rroot, rm)
+            self.assertEqual(km.uci(), step["move"], board.fen())
+            golden.assert_tree(self, kroot, step["tree"])
+            board.push(km)
             kroot = PUCT.advance_root(kroot, km)
 
 

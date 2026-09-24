@@ -1,7 +1,7 @@
-"""kit Gumbel 与 S ``stateseq.gumbel`` 的逐位对照，以及着法级 ``Gumbel`` 的行为测试。
+"""kit Gumbel 与旧 S ``stateseq.gumbel``（冻结为 tests/fixtures/s_gumbel）的逐位对照，以及着法级 ``Gumbel`` 的行为测试。
 
-1. 节点级：同一棵确定性随机树上，kit 与 S 的 ``order_halving`` 选着、访问数、Q 累加、
-   π′ 逐字节一致（g=0/1、多组预算 / m0 / c_scale）。需要兄弟仓库 SSM（UNICHESS_S_ROOT）。
+1. 节点级：同一棵确定性随机树上，kit 的 ``order_halving`` 选着、访问数、Q 累加、
+   π′ 与旧 S 实现的冻结结果逐字节一致（g=0/1、多组预算 / m0 / c_scale）。
 2. 着法级：``Gumbel`` 接 Expander 在真实棋盘上搜索，与「S arena 口径的同步 order_halving +
    路径重放 expand」逐位一致——即 S 接入 kit 后搜索结果不变的前提。
 3. 行为：一步杀、终局根、只给先验时退化为 log 先验、展开深度直方图。
@@ -14,13 +14,12 @@ import zlib
 import chess
 import numpy as np
 
-from tests import _siblings
-from unichess_kit.api import EvalRequest
-from unichess_kit.api.types import NodeEval
-from unichess_kit.runtime import run_sync
-from unichess_kit.search import gumbel as kg
+from Kit.tests import golden
+from Kit.api import EvalRequest
+from Kit.api.types import NodeEval
+from Kit.runtime import run_sync
+from Kit.search import gumbel as kg
 
-(SG,) = _siblings.load("S", "stateseq.gumbel") or (None,)
 
 
 # ---------------- 确定性随机世界 ----------------
@@ -54,30 +53,50 @@ CASES = [(g, n_sims, m0, cs, root_seed)
          for root_seed in (0, 1, 2)]
 
 
-@unittest.skipIf(SG is None, "需要兄弟仓库 SSM（UNICHESS_S_ROOT）")
+def _hexs(v):
+    if v is None:
+        return None
+    if isinstance(v, np.ndarray):
+        return [float.hex(float(x)) for x in v.ravel()]
+    return float.hex(float(v))
+
+
+def _plain(v):
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    return int(v) if isinstance(v, np.integer) else v
+
+
 class TestNodeLevelParity(unittest.TestCase):
+    """与旧 S ``stateseq.gumbel`` 的冻结结果（tests/fixtures/s_gumbel）逐位一致。"""
+
     def test_order_halving_bitwise(self):
+        gold = golden.load("s_gumbel")
+        checked = 0
         for g, n_sims, m0, cs, root_seed in CASES:
             with self.subTest(g=g, n_sims=n_sims, m0=m0, c_scale=cs, root=root_seed):
-                path0 = ("root", root_seed)
-                rs, rk = _mk(SG, path0, 0), _mk(kg, path0, 0)
-                if rs.is_terminal:
+                rk = _mk(kg, ("root", root_seed), 0)
+                if rk.is_terminal:
                     continue
-                a = SG.order_halving(rs, _expand_for(SG), n_sims=n_sims, m0=m0, g=g,
-                                     seed=np.random.default_rng(root_seed), c_visit=50.0, c_scale=cs)
+                rec = gold[checked]
+                checked += 1
+                self.assertEqual((rec["g"], rec["n_sims"], rec["m0"], rec["c_scale"], rec["root_seed"]),
+                                 (g, n_sims, m0, cs, root_seed))
                 b = kg.order_halving(rk, _expand_for(kg), n_sims=n_sims, m0=m0, g=g,
                                      seed=np.random.default_rng(root_seed), c_visit=50.0, c_scale=cs)
-                for k in ("action", "noise", "sims_used", "rounds", "budget_check",
-                          "survivors_per_round", "qmin", "qmax", "n_nodes", "n_terminal"):
-                    self.assertEqual(a[k], b[k], k)
-                self.assertEqual(rs.n.tobytes(), rk.n.tobytes())
-                self.assertEqual(rs.q_sum.tobytes(), rk.q_sum.tobytes())
-                ia, pa = SG.export_pi_prime(rs, 50.0, cs)
+                for k in ("action", "sims_used", "rounds", "budget_check", "survivors_per_round",
+                          "n_nodes", "n_terminal"):
+                    self.assertEqual(_plain(b[k]), rec[k], k)
+                for k in ("noise", "qmin", "qmax"):
+                    self.assertEqual(_hexs(b[k]), rec[k], k)
+                self.assertEqual(np.asarray(rk.n).tolist(), rec["n"])
+                self.assertEqual(_hexs(np.asarray(rk.q_sum)), rec["q_sum"])
                 ib, pb = kg.export_pi_prime(rk, 50.0, cs)
-                self.assertEqual(ia.tobytes(), ib.tobytes())
-                self.assertEqual(pa.tobytes(), pb.tobytes())
+                self.assertEqual(np.asarray(ib).tolist(), rec["pi_ids"])
+                self.assertEqual(_hexs(np.asarray(pb)), rec["pi"])
                 self.assertEqual(sum(b["expand_hist"]), b["n_nodes"])
                 self.assertEqual(len(b["tree"]), b["n_nodes"] + 1)
+        self.assertEqual(checked, len(gold))
 
 
 # ---------------- 着法级：Expander + 真实棋盘 ----------------
@@ -164,14 +183,14 @@ class TestMoveLevelGumbel(unittest.TestCase):
                     board = chess.Board(fen)
                     ev = _BoardEval()
                     mv_ref, root_ref, res_ref = _s_style_search(
-                        SG or kg, board, ev, n_sims=48, m0=8, g=g, seed=seed, c_scale=0.1)
+                        kg, board, ev, n_sims=48, m0=8, g=g, seed=seed, c_scale=0.1)
                     search = kg.Gumbel(_Expander(ev), kg.GumbelConfig(simulations=48, m0=8, g=g))
                     out = run_sync(search.search(board, rng=np.random.default_rng(seed)))
                     self.assertEqual(out.move, mv_ref)
                     self.assertEqual(out.root.n.tobytes(), root_ref.n.tobytes())
                     self.assertEqual(out.root.q_sum.tobytes(), root_ref.q_sum.tobytes())
                     moves, probs = out.pi_prime(search.cfg)
-                    _, probs_ref = (SG or kg).export_pi_prime(root_ref, 50.0, 0.1)
+                    _, probs_ref = (kg).export_pi_prime(root_ref, 50.0, 0.1)
                     self.assertEqual(moves, list(board.legal_moves))
                     self.assertEqual(probs.tobytes(), probs_ref.tobytes())
                     for k in ("sims_used", "n_nodes", "n_terminal"):

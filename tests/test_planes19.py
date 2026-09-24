@@ -1,11 +1,12 @@
+import hashlib
 import unittest
 
 import chess
 import numpy as np
 
-from unichess_kit.contrib import planes19 as p19
-from unichess_kit.testing import ExpanderContract, FakePlanesEvaluator, contract_boards
-from tests import _siblings
+from Kit import planes19 as p19
+from Kit.testing import ExpanderContract, FakePlanesEvaluator, contract_boards
+from Kit.tests import golden
 
 
 def sample_boards():
@@ -58,39 +59,34 @@ class TestEncoding(unittest.TestCase):
 
 
 class TestParityWithEngines(unittest.TestCase):
-    """kit 的 planes19 与 R / T 各自的 core.encoding、core.moves 逐位一致。"""
+    """kit 的 planes19 与旧 R / T ``core.encoding``、``core.moves``、R ``priors_from_policy``
+    的冻结输出（tests/fixtures/planes19_encoding、r_priors）逐位一致。旧 R 与 T 生成时已互相核对。"""
 
-    def check(self, which):
-        mods = _siblings.load(which, "core.encoding", "core.moves")
-        if mods is None:
-            self.skipTest(f"找不到 {which} 仓库")
-        enc, moves = mods
-        for b in sample_boards():
-            np.testing.assert_array_equal(p19.encode(b), enc.encode(b), err_msg=f"{which} {b.fen()}")
+    def test_encoding_and_moves(self):
+        g = golden.load("planes19_encoding")
+        self.assertEqual(list(p19.PROMO_PIECES), g["promo_pieces"])
+        boards = sample_boards()
+        self.assertEqual(len(boards), len(g["rows"]))
+        for b, row in zip(boards, g["rows"]):
+            self.assertEqual(b.fen(), row["fen"])
+            x = np.ascontiguousarray(p19.encode(b), dtype=np.float32)
+            self.assertEqual(hashlib.sha256(x.tobytes()).hexdigest(), row["planes_sha256"], b.fen())
+            got = []
             for m in b.legal_moves:
                 om = p19.orient_move(m, b.turn)
-                self.assertEqual(om, enc.orient_move(m, b.turn))
-                self.assertEqual(p19.move_to_index(om), moves.move_to_index(om))
-                self.assertEqual(p19.move_to_promo_index(om), moves.move_to_promo_index(om))
-        self.assertEqual(tuple(moves.PROMO_PIECES), p19.PROMO_PIECES)
-
-    def test_r(self):
-        self.check("R")
-
-    def test_t(self):
-        self.check("T")
+                got.append([m.uci(), om.uci(), p19.move_to_index(om), p19.move_to_promo_index(om)])
+            self.assertEqual(got, row["legal"], b.fen())
 
     def test_priors_match_r(self):
-        mods = _siblings.load("R", "search.mcts")
-        if mods is None:
-            self.skipTest("找不到 R 仓库")
+        g = golden.load("r_priors")
         ev = FakePlanesEvaluator()
-        for b in sample_boards():
+        boards = sample_boards()
+        self.assertEqual(len(boards), len(g))
+        for b, row in zip(boards, g):
             policy, promo, _ = ev._one(b)
             km, kp = p19.priors_from_policy(b, policy, promo)
-            rm, rp = mods[0].priors_from_policy(b, policy, promo)
-            self.assertEqual(km, rm)
-            np.testing.assert_array_equal(kp, rp)
+            self.assertEqual([m.uci() for m in km], row["moves"])
+            np.testing.assert_array_equal(np.asarray(kp, np.float64), golden.floats(row["p"]))
 
 
 class TestExpander(ExpanderContract, unittest.TestCase):

@@ -1,8 +1,8 @@
 import math
 import unittest
 
-from unichess_kit import stats
-from tests import _siblings
+from Kit import stats
+from Kit.tests import golden
 
 
 class TestElo(unittest.TestCase):
@@ -53,16 +53,14 @@ class TestSprt(unittest.TestCase):
                          "H1")
 
     def test_matches_r_when_no_empty_bin(self):
-        mods = _siblings.load("R", "eval.arena")
-        if mods is None:
-            self.skipTest("找不到 R 仓库")
-        (arena,) = mods
-        for w, d, l in ((30, 40, 30), (41, 33, 26), (12, 70, 18)):
-            self.assertAlmostEqual(stats.sprt_llr(w, d, l, 0, 10),
-                                   arena.sprt_llr(w, d, l, 0, 10), places=9)
-            for a, b in zip(stats.elo_with_error(w, d, l), arena.elo_with_error(w, d, l)):
-                self.assertAlmostEqual(a, b, places=9)
-            self.assertAlmostEqual(stats.los(w, d, l), arena.los(w, d, l))
+        """与旧 R ``eval/arena.py`` 的冻结结果（tests/fixtures/r_stats）一致。"""
+        for row in golden.load("r_stats"):
+            w, d, l = row["wdl"]
+            self.assertAlmostEqual(stats.sprt_llr(w, d, l, 0, 10), float.fromhex(row["sprt_llr"]),
+                                   places=9)
+            for a, b in zip(stats.elo_with_error(w, d, l), row["elo_with_error"]):
+                self.assertAlmostEqual(a, float.fromhex(b), places=9)
+            self.assertAlmostEqual(stats.los(w, d, l), float.fromhex(row["los"]))
 
 
 class TestPentanomial(unittest.TestCase):

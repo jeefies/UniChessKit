@@ -17,15 +17,15 @@ import zlib
 import chess
 import numpy as np
 
-from unichess_kit.api import GameStart, SearchBudget
-from unichess_kit.contrib.planes19 import Planes19Expander, encode, make_search_player_factory
-from unichess_kit.players import SearchPlayer
-from unichess_kit.rules import TablebaseOracle
-from unichess_kit.runtime import run_sync
-from unichess_kit.search import PUCT, PUCTConfig
-from unichess_kit.search import native
-from unichess_kit.search.puct_cpp import PUCTCpp, move_code
-from unichess_kit.testing import FakePlanes19Model
+from Kit.api import GameStart, SearchBudget
+from Kit.planes19 import Planes19Expander, encode, make_search_player_factory
+from Kit.players import SearchPlayer
+from Kit.rules import TablebaseOracle
+from Kit.runtime import run_sync
+from Kit.search import PUCT, PUCTConfig
+from Kit.search import native
+from Kit.search.puct_cpp import PUCTCpp, move_code
+from Kit.testing import FakePlanes19Model
 
 if shutil.which(os.environ.get("CXX", "g++")) is None:
     # 只有没有编译器时才跳过；有编译器而编译失败必须报错（不静默跳过）

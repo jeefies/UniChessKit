@@ -7,7 +7,7 @@ import unittest
 
 import numpy as np
 
-from unichess_kit.search.gumbel import Node, _select_action_ref, select_action
+from Kit.search.gumbel import Node, _select_action_ref, select_action
 
 
 def _rand_node(rng: np.random.Generator) -> Node:

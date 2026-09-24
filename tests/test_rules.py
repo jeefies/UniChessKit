@@ -4,7 +4,7 @@ from pathlib import Path
 
 import chess
 
-from unichess_kit.rules import (BUNDLED_OPENINGS, OpeningBook, StandardReferee, TablebaseOracle,
+from Kit.rules import (BUNDLED_OPENINGS, OpeningBook, StandardReferee, TablebaseOracle,
                                 classify, parse_line)
 
 

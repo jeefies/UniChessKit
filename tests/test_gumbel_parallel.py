@@ -10,11 +10,11 @@ import unittest
 import chess
 import numpy as np
 
-from unichess_kit.api import EvalRequest, gather
-from unichess_kit.contrib.planes19 import Planes19Expander
-from unichess_kit.runtime import Batcher, run_sync
-from unichess_kit.search.gumbel import Gumbel, GumbelConfig
-from unichess_kit.testing.fakes import FakePlanesEvaluator
+from Kit.api import EvalRequest, gather
+from Kit.planes19 import Planes19Expander
+from Kit.runtime import Batcher, run_sync
+from Kit.search.gumbel import Gumbel, GumbelConfig
+from Kit.testing.fakes import FakePlanesEvaluator
 
 
 class _Echo:

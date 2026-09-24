@@ -6,16 +6,16 @@ from pathlib import Path
 
 import chess
 
-from unichess_kit.api import PlayerError, immediate
-from unichess_kit.api.types import MoveDecision
-from unichess_kit.pipelines.match import (MatchConfig, SprtConfig, plan_games, run_match,
+from Kit.api import PlayerError, immediate
+from Kit.api.types import MoveDecision
+from Kit.pipelines.match import (MatchConfig, SprtConfig, plan_games, run_match,
                                           summarize)
-from unichess_kit.players import RandomPlayer
-from unichess_kit.registry import EngineSpec
-from unichess_kit.testing.fakes import (make_failing_player_factory, make_fake_player_factory,
+from Kit.players import RandomPlayer
+from Kit.registry import EngineSpec
+from Kit.testing.fakes import (make_failing_player_factory, make_fake_player_factory,
                                         make_random_player_factory)
 
-KIT = "unichess_kit.testing.fakes"
+KIT = "Kit.testing.fakes"
 
 
 def strip(records):
@@ -37,7 +37,7 @@ class Base(unittest.TestCase):
 
 class TestPlan(unittest.TestCase):
     def test_pairs_share_opening_and_swap_colours(self):
-        from unichess_kit.pipelines.match import load_book
+        from Kit.pipelines.match import load_book
         cfg = MatchConfig(pairs=5, seed=2)
         tasks = plan_games(cfg, load_book("bundled"))
         self.assertEqual([t.game for t in tasks], list(range(10)))
@@ -58,7 +58,7 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(cfg.sprt.elo1, 20)
 
     def test_max_plies_after_opening(self):
-        from unichess_kit.pipelines.match import load_book
+        from Kit.pipelines.match import load_book
         whole = MatchConfig(pairs=3, max_plies=10)
         after = MatchConfig(pairs=3, max_plies=10, max_plies_after_opening=True)
         for t in plan_games(after, load_book("bundled")):
@@ -222,7 +222,7 @@ class TestMatchWorkers(Base):
         self.assertGreater(s["batch"]["forwards"], 0)
 
     def test_worker_error_stops(self):
-        from unichess_kit.runtime import WorkerError
+        from Kit.runtime import WorkerError
         with self.assertRaisesRegex(WorkerError, "故意失败"):
             run_match(MatchConfig(pairs=2, max_plies=30, workers=2),
                       spec_a=self.spec("make_failing_player_factory", fail_after=1),
@@ -231,7 +231,7 @@ class TestMatchWorkers(Base):
 
 class TestCli(Base):
     def test_cli(self):
-        from unichess_kit.pipelines.match import main
+        from Kit.pipelines.match import main
         conf = {"a": {"factory": f"{KIT}:make_fake_player_factory", "kwargs": {"name": "a"},
                       "label": "fake-a"},
                 "b": {"factory": f"{KIT}:make_random_player_factory", "label": "rand"},

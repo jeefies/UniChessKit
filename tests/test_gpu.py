@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from unichess_kit.runtime import FileLock, GpuBusyError, GpuLease, is_locked
+from Kit.runtime import FileLock, GpuBusyError, GpuLease, is_locked
 
 
 def smi(total=16000, used=0, procs=None):

@@ -1,8 +1,8 @@
 import unittest
 
-from unichess_kit.api import EvalRequest, immediate
-from unichess_kit.runtime import Batcher, CoroutinePool, WorkerError, WorkerPool, run_sync
-from unichess_kit.testing import fakes
+from Kit.api import EvalRequest, immediate
+from Kit.runtime import Batcher, CoroutinePool, WorkerError, WorkerPool, run_sync
+from Kit.testing import fakes
 
 
 class Echo:

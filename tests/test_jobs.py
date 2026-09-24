@@ -8,15 +8,15 @@ from pathlib import Path
 
 import chess
 
-from unichess_kit.jobs import JobHandle
-from unichess_kit.pipelines.match import MatchConfig, run_match
-from unichess_kit.testing.fakes import make_fake_player_factory
+from Kit.jobs import JobHandle
+from Kit.pipelines.match import MatchConfig, run_match
+from Kit.testing.fakes import make_fake_player_factory
 
 KIT_ROOT = Path(__file__).resolve().parents[1]
 
-FAKE = {"factory": "unichess_kit.testing.fakes:make_fake_player_factory",
+FAKE = {"factory": "Kit.testing.fakes:make_fake_player_factory",
         "kwargs": {"simulations": 8}}
-RANDOM = {"factory": "unichess_kit.testing.fakes:make_random_player_factory"}
+RANDOM = {"factory": "Kit.testing.fakes:make_random_player_factory"}
 
 
 def env():
@@ -144,7 +144,7 @@ class TestJobs(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "进程组 SIGTERM 仅 POSIX")
     def test_stop(self):
-        slow = {"factory": "unichess_kit.testing.fakes:make_slow_player_factory",
+        slow = {"factory": "Kit.testing.fakes:make_slow_player_factory",
                 "kwargs": {"delay_s": 0.2}}
         h = self.submit("s1", {"kind": "match", "a": slow, "b": slow,
                                "match": {"pairs": 50, "max_plies": 200, "concurrency": 2}})

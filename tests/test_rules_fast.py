@@ -6,7 +6,7 @@ import unittest
 
 import chess
 
-from unichess_kit.rules import fast
+from Kit.rules import fast
 
 
 def _positions(seed: int, n_games: int = 40, max_plies: int = 160):
