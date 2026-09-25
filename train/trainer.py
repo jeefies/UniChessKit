@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import math
 import signal
@@ -114,6 +115,9 @@ class Trainer:
             torch.backends.cudnn.allow_tf32 = bool(t["tf32"])
         if t.get("deterministic"):
             torch.use_deterministic_algorithms(True)
+        frac = t.get("cuda_mem_fraction")          # 很少用：大模型 + 多进程并训时才限制
+        if frac and torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(float(frac), 0)
 
     def _optimizer(self, model):
         o = dict(self.cfg.optimizer)
@@ -178,6 +182,13 @@ class Trainer:
         if self.task is None:
             self.task = build_task(cfg)
         task = self.task
+        if cfg.steps == 0:      # "跑一个 epoch"：步数由任务的 auto_steps(accum) 从数据量算，
+            auto = _optional(task, "auto_steps")   # 必须在建模型/调度之前定下来
+            resolved = auto(cfg.accum) if auto else None
+            if not resolved or int(resolved) <= 0:
+                raise RuntimeError("steps=0 需要任务提供 auto_steps(accum) 返回正步数")
+            cfg.steps = int(resolved)
+            print(f"steps=0 → 任务的 auto_steps(accum={cfg.accum}) = {cfg.steps}", flush=True)
         model = task.build_model().to(device)
         opt = self._optimizer(model)
         sched, manual = build_schedule(cfg.schedule, opt, cfg.steps,
@@ -213,6 +224,13 @@ class Trainer:
         amp = (torch.autocast(device.type, dtype=torch.bfloat16) if cfg.precision == "bf16"
                else contextlib.nullcontext())
         stream = task.batches(ctx)
+        # 有模型的损失依赖"训练总步数"做退火（如 S 的 recon 权重 1.0→0.1）。任务的 loss()
+        # 若声明了 total_steps 形参就传给它，否则保持老的三参数调用。
+        loss_fn = task.loss
+        try:
+            loss_wants_total = "total_steps" in inspect.signature(loss_fn).parameters
+        except (TypeError, ValueError):        # 内置函数 / C 实现的 callable
+            loss_wants_total = False
         export = cfg.export
         log_path = self.out / "train.jsonl"
 
@@ -237,15 +255,23 @@ class Trainer:
                 for _ in range(cfg.accum):
                     batch = next(stream)
                     with amp:
-                        loss, parts = task.loss(model, batch, step)
+                        loss, parts = (task.loss(model, batch, step, total_steps=cfg.steps)
+                                       if loss_wants_total
+                                       else task.loss(model, batch, step))
                     scaled = loss / cfg.accum if cfg.accum > 1 else loss
                     (scaler.scale(scaled) if scaler.is_enabled() else scaled).backward()
                     d = loss.detach()
                     total = d if total is None else total + d
                     for k, v in (parts or {}).items():
-                        if torch.is_tensor(v) and v.ndim == 0:
-                            v = v.detach().float()
-                            sums[k] = sums.get(k, 0.0) + v / cfg.accum
+                        # parts 既可以是 0 维张量，也可以是 Python 数值（旧脚本的 metrics.jsonl
+                        # 就是纯 float）；只收标量，list / 多维张量一律跳过。
+                        if isinstance(v, torch.Tensor):
+                            if v.ndim != 0:
+                                continue
+                            v = float(v.detach().float())
+                        elif isinstance(v, bool) or not isinstance(v, (int, float)):
+                            continue
+                        sums[k] = sums.get(k, 0.0) + float(v) / cfg.accum
                 if scaler.is_enabled():
                     scaler.unscale_(opt)
                 norm = (torch.nn.utils.clip_grad_norm_(clip_params, cfg.clip) if cfg.clip > 0

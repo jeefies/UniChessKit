@@ -82,8 +82,9 @@ class TrainConfig:
             raise ValueError("task 应为 {'factory': '包.模块:函数', 'kwargs': {...}}")
         if set(self.task) - {"factory", "kwargs"}:
             raise ValueError(f"task 有未知字段 {sorted(set(self.task) - {'factory', 'kwargs'})}")
-        if self.steps <= 0 or self.accum <= 0:
-            raise ValueError("steps / accum 必须为正")
+        if self.steps < 0 or self.accum <= 0:
+            raise ValueError("steps / accum 必须为正（steps=0 表示由任务的 auto_steps() 决定，"
+                             "见 Kit/train/trainer.py）")
         if self.precision not in _PRECISIONS:
             raise ValueError(f"precision 应为 {_PRECISIONS}")
         if self.nonfinite not in _NONFINITE:
@@ -91,7 +92,8 @@ class TrainConfig:
         unknown = set(self.optimizer) - {"lr", "weight_decay", "betas", "eps", "fused"}
         if unknown:
             raise ValueError(f"optimizer 有未知字段 {sorted(unknown)}")
-        unknown = set(self.torch) - {"num_threads", "cudnn_benchmark", "tf32", "deterministic"}
+        unknown = set(self.torch) - {"num_threads", "cudnn_benchmark", "tf32", "deterministic",
+                                     "cuda_mem_fraction"}
         if unknown:
             raise ValueError(f"torch 有未知字段 {sorted(unknown)}")
         unknown = set(self.export) - {"best", "final", "every", "every_name"}
