@@ -72,7 +72,16 @@ class SearchPlayer:
         self.last_info: dict = {}
 
     def new_game(self, start: GameStart) -> Think[None]:
-        self._reset(start.seed)
+        # 自对弈的多局多样性：把局序号混进随机数流，口径与 SsmSelfPlayer 相同
+        # （``default_rng(SeedSequence(seed, spawn_key=(index,)))``）。index=0（批量对弈
+        # 口径）时保持旧行为逐位不变——arena 那边每局的种子本来就是按局现算的。
+        # 注意不能在管线里改成传 per-game 整数种子：S 的开局 π′ 缓存键是
+        # (seed, book_id, ply)，故意不含局序号，换了种子缓存就全落空。
+        seed = int(start.seed)
+        if getattr(start, "index", 0):
+            seed = int(np.random.SeedSequence(seed, spawn_key=(int(start.index),))
+                       .generate_state(1, dtype=np.uint32)[0])
+        self._reset(seed)
         self.record_visits = start.both_sides      # 自对弈：决策里带根访问分布（训练目标）
         # pipelines.selfplay 的 GameStart.book：前若干 ply 原样走出，不搜索。
         # 这些 ply 没有访问分布，sink 自动跳过，与 polyglot 书的行为一致。

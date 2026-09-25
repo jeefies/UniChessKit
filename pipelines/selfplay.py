@@ -8,12 +8,14 @@
    开局分配，破坏与既有数据的可比性）。非法线丢弃并计数。
 - **分片**：局序号是全局的（``first_game`` 起），开局、随机数流、局键都只取决于全局序号，
    因此把 N 局拆给多个进程（各取不相交区间、同一 seed）与单进程跑出的是同一批对局。
-- **随机数**：每局的随机数流由 (seed, 局序号) 决定——管线用 ``game_seed_sequence(seed, 局序号)``
-   为每局派生一个整数种子交给 Player（见 ``_game_seed``），与 S 的
-   ``SeedSequence(seed).spawn(num_games)[index]`` 逐位同源。**Player 只吃一个种子**
-   （``SearchPlayer._reset`` / S 的 Player 都只用 ``start.seed``），所以必须由管线派生：
-   直接传全局 seed 会让同一批所有对局共用一条随机数流、下出同一盘棋（2026-09-26 实测：
-   32 局全部 79-141 ply 三次重复，局面 100% 重合）。
+- **随机数**：管线把**全局 seed 原样**交给 Player，同时通过 ``GameStart.index`` 给出局序号；
+    每局的随机数流由 Player 自己按 ``default_rng(SeedSequence(seed, spawn_key=(index,)))``
+    派生（``SsmSelfPlayer`` 与 ``SearchPlayer`` 都是这个口径，与
+    ``SeedSequence(seed).spawn(num_games)[index]`` 逐位同源）。**不要**改成在管线里派生后
+    只传一个整数种子：S 的开局 π′ 缓存键是 ``(seed, book_id, ply)``，故意不含局序号，
+    这样同一条开局在所有局里共享搜索结果；换了 per-game 种子缓存全部落空。
+- **开局库缺失时的多样性**：没有开局文件时（``openings=None``）只有随机数流在区分各局，
+    所以各局棋谱必然不同，但开局阶段完全一致。
 - **裁决**：rules.StandardReferee（claim_draw 语义；max_plies 按整盘计，含 book）。
 - 出错整批停止（CoroutinePool 语义），Sink 不会收到半局。
 
@@ -68,17 +70,6 @@ class SelfPlayTask:
 def game_seed_sequence(seed: int, index: int) -> np.random.SeedSequence:
     """第 index 局的随机数种子序列（= ``SeedSequence(seed).spawn(n)[index]``）。"""
     return np.random.SeedSequence(int(seed), spawn_key=(int(index),))
-
-
-def _game_seed(seed: int, game: int) -> int:
-    """第 game 局交给 Player 的种子：由 (seed, 局序号) 派生的确定性整数。
-
-    Player 的随机数流只吃一个 int（``SearchPlayer._reset`` 用
-    ``random.Random(seed)`` / ``default_rng(seed)``），所以这里把 ``game_seed_sequence``
-    收敛成一个 32 位整数：局号相同 ⇒ 种子相同（同配置可复现、可按局号拆进程），
-    局号不同 ⇒ 种子不同（同一批对局不会共用随机数流）。
-    """
-    return int(game_seed_sequence(seed, game).generate_state(1, dtype=np.uint32)[0])
 
 
 def load_book_lines(path, book_plies: int) -> tuple:
@@ -183,7 +174,7 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
             progress(record, totals["games"])
 
     jobs = ((t.game, (lambda t=t: play_selfplay_game(t, make_player(), referee, budget,
-                                                     _game_seed(cfg.seed, t.game))))
+                                                     cfg.seed)))
             for t in tasks)
     pool.run(jobs, on_done, should_stop=should_stop or (lambda: False))
     elapsed = time.perf_counter() - t0

@@ -9,7 +9,7 @@ import chess
 import numpy as np
 
 from Kit.api import EvalRequest, MoveDecision, PlayerError, immediate
-from Kit.pipelines.selfplay import (SelfPlayConfig, _game_seed, game_seed_sequence,
+from Kit.pipelines.selfplay import (SelfPlayConfig, game_seed_sequence,
                                     load_book_lines, plan_selfplay, run_selfplay)
 
 
@@ -57,16 +57,18 @@ class _BookRandomPlayer:
         self.closed = True
 
 
-class _SeedOnlyPlayer(_BookRandomPlayer):
-    """只用 ``start.seed`` 的 Player（``SearchPlayer`` / S 的 Player 就是这个口径）。
+class _IndexDerivedPlayer(_BookRandomPlayer):
+    """按 ``(seed, index)`` 派生随机数流的 Player——真实引擎的口径。
 
-    随机数流不感知局号，所以**管线必须为每局派生不同种子**，否则同一批对局会共用
-    一条随机数流、下出同一盘棋（2026-09-26 实测：32 局只剩 1 盘棋的局面）。
+    ``SsmSelfPlayer`` 用 ``default_rng(SeedSequence(seed, spawn_key=(index,)))``；
+    ``SearchPlayer.new_game`` 在 ``index != 0`` 时同样这么派生。管线只负责把全局
+    seed 原样传下去并给出 ``GameStart.index``，派生是 Player 自己的事。
     """
 
     def new_game(self, start):
         self.start = start
-        self.rng = np.random.default_rng(start.seed)
+        self.rng = np.random.default_rng(
+            np.random.SeedSequence(int(start.seed), spawn_key=(int(start.index),)))
         return immediate(None)
 
 
@@ -213,29 +215,43 @@ class TestRunSelfPlay(unittest.TestCase):
 
 
 class TestPerGameSeed(unittest.TestCase):
-    """每局的随机数流必须按局号派生（G1：全局 seed 会让同一批对局变成同一盘棋）。"""
+    """每局的随机数流必须按局号派生（G1：全局 seed 会让同一批对局变成同一盘棋）。
+
+    分工：管线把全局 seed 原样交给 Player 并给出 ``GameStart.index``；由 Player 按
+    (seed, index) 派生自己的流。不能反过来在管线里派生整数种子——S 的开局 π′ 缓存键
+    是 ``(seed, book_id, ply)``，故意不含局序号，同一条开局要在所有局里共享搜索结果。
+    """
 
     def _run(self, games=6, seed=5, max_plies=20, concurrency=1):
         ev = _CountEval()
         sink = _Sink()
         cfg = SelfPlayConfig(games=games, seed=seed, max_plies=max_plies,
-                             concurrency=concurrency)
-        run_selfplay(cfg, lambda: _SeedOnlyPlayer(ev), sink)
+                            concurrency=concurrency)
+        run_selfplay(cfg, lambda: _IndexDerivedPlayer(ev), sink)
         return sink
 
-    def test_seed_only_player_gets_distinct_games(self):
-        sink = self._run()
-        self.assertEqual(len(sink.games), 6)
-        moves = [tuple(r["moves"]) for r, _, _ in sink.games]
-        self.assertEqual(len(set(moves)), 6)          # 6 局不能是同一盘棋的副本
+    def test_pipeline_passes_global_seed_and_game_index(self):
+        seen = self._run(games=5).games
+        moves = [tuple(r["moves"]) for r, _, _ in seen]
+        self.assertEqual(len(moves), 5)
+        self.assertEqual(len(set(moves)), 5)
 
-    def test_derived_seed_is_stable_and_distinct(self):
-        seeds = [_game_seed(5, g) for g in range(6)]
-        self.assertEqual(len(set(seeds)), 6)
-        self.assertEqual(_game_seed(5, 3), _game_seed(5, 3))       # 同局号 ⇒ 同种子
-        self.assertNotEqual(_game_seed(5, 3), _game_seed(6, 3))    # 换 seed ⇒ 换流
-        for g in range(6):
-            self.assertIsInstance(_game_seed(5, g), int)
+    def test_seed_and_index_reach_the_player(self):
+        starts = []
+        ev = _CountEval()
+
+        class _Recorder(_IndexDerivedPlayer):
+            def new_game(self, start):
+                starts.append((start.seed, start.index))
+                return super().new_game(start)
+
+        sink = _Sink()
+        run_selfplay(SelfPlayConfig(games=4, seed=9, max_plies=12, concurrency=1),
+                     lambda: _Recorder(ev), sink)
+        seeds = {s for s, _ in starts}
+        idx = {i for _, i in starts}
+        self.assertEqual(seeds, {9}, "seed 必须原样传下去（S 的 π′ 缓存键依赖它）")
+        self.assertEqual(idx, {0, 1, 2, 3}, "每局必须给出不同的 GameStart.index")
 
     def test_same_seed_reproduces_games(self):
         a = [tuple(r["moves"]) for r, _, _ in self._run().games]
@@ -243,20 +259,18 @@ class TestPerGameSeed(unittest.TestCase):
         self.assertEqual(a, b)                        # 同配置可复现
 
     def test_split_by_game_index_matches_whole(self):
-        whole = [tuple(r["moves"]) for r, _, _ in self._run(games=5).games]
+        whole = self._run(games=5).games
+        by_game = {r["game"]: tuple(r["moves"]) for r, _, _ in whole}
         parts = []
         for first, n in ((0, 2), (2, 3)):
             ev = _CountEval()
             sink = _Sink()
             run_selfplay(SelfPlayConfig(games=n, seed=5, max_plies=20, concurrency=1,
-                                        first_game=first),
-                         lambda: _SeedOnlyPlayer(ev), sink)
+                                       first_game=first),
+                         lambda: _IndexDerivedPlayer(ev), sink)
             parts += sorted((r["game"], tuple(r["moves"])) for r, _, _ in sink.games)
-        by_game = {g: mv for g, mv in sorted((r["game"], tuple(r["moves"]))
-                                             for r, _, _ in self._run(games=5).games)}
         self.assertEqual(parts, sorted(by_game.items()))
         self.assertEqual(len(parts), 5)
-        self.assertEqual(whole, [mv for _, mv in sorted(by_game.items())])
 
 
 if __name__ == "__main__":
