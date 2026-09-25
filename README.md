@@ -11,7 +11,7 @@ UniChess 各引擎（S / T / R）共享的管线库。引擎只实现少量协�
 | `runtime` | `Batcher`（按 `model_key` 跨局攒批，一模型一拍一次前向）、`CoroutinePool`、`WorkerPool`（spawn；只有显式 done/error 才算结束）、`GpuLease`、`FileLock` |
 | `rules` | `StandardReferee`（`claim_draw=True` 语义，超 `max_plies` 记 truncated）、`OpeningBook`、`TablebaseOracle` |
 | `stats` | Elo±CI、LOS、三项/五项 GSPRT（单一实现） |
-| `search` | `PUCT`：R `search/mcts.py` 的协程化移植，逐节点一致（有 parity 测试）；`Gumbel`：S `stateseq/gumbel.py` 的顺序减半，节点级函数同名同签名（S 的 `test_gumbel` 原样沿用），与 S 逐字节一致（`test_gumbel_parity`），`NodeEval.logits` 提供原始 logits |
+| `search` | `PUCT`：R `search/mcts.py` 的协程化移植，逐节点一致（有 parity 测试），C++ 版 `PUCTCpp` 与 Python 整树逐位一致；`Gumbel`：顺序减半搜索的**唯一实现**（S 的旧 `stateseq/gumbel.py` 已删，黄金口径在这里），与 S 逐字节一致（`test_gumbel_parity`） |
 | `players` | `SearchPlayer`（残局表 → 开局库 → 搜索 → 策略）、`RandomPlayer`、`UciPlayer` |
 | `pipelines.match` | 配对换色 + 开局 + SPRT 早停 + JSONL 断点续跑 + 多进程 |
 | `contrib.planes19` | T/R 共用的 19 平面编码与 `Planes19Expander` |
@@ -29,7 +29,7 @@ UniChess 各引擎（S / T / R）共享的管线库。引擎只实现少量协�
 引擎仓库提供一个工厂函数，返回无参的 `PlayerFactory`（每局新建一个 Player）：
 
 ```python
-# unichess_t/kit_adapter.py
+# Transformer/kit.py
 KIT_SPI_VERSION = 1
 
 def make_player_factory(checkpoint, simulations=800, **kw):
@@ -42,14 +42,14 @@ def make_player_factory(checkpoint, simulations=800, **kw):
 ## 批量对弈
 
 ```bash
-python -m unichess_kit.match match.json --out runs/t_vs_r/results.jsonl
+python -m Kit match match.json --out runs/t_vs_r/results.jsonl
 ```
 
 ```json
 {
-  "a": {"factory": "unichess_t.kit_adapter:make_player_factory", "root": "/home/jeefy/UniChess/Transformer",
+  "a": {"factory": "Transformer.kit:make_player_factory", "root": "/home/jeefy/UniChess/Transformer",
         "kwargs": {"checkpoint": "runs/transformer_20m/best_model.pt"}, "label": "T-20M"},
-  "b": {"factory": "unichess_r.kit_adapter:make_player_factory", "root": "/home/jeefy/UniChess/ResNet",
+  "b": {"factory": "ResNet.kit:make_player_factory", "root": "/home/jeefy/UniChess/ResNet",
         "kwargs": {"checkpoint": "runs/stage1/ckpt_00187578.pt"}, "label": "R"},
   "match": {"pairs": 32, "seed": 0, "max_plies": 400, "concurrency": 8, "workers": 1,
             "openings": "bundled", "sprt": null}
@@ -68,7 +68,7 @@ worker 转发），`should_stop` 返回真时不再开新局。
 ## 后台 job（Server 用）
 
 ```bash
-python -m unichess_kit.jobs <job_dir>      # job_dir/job.json 描述任务
+python -m Kit.jobs <job_dir>      # job_dir/job.json 描述任务
 ```
 
 `job.json`：`{"kind": "match"|"game", "a": EngineSpec, "b": EngineSpec, "names": {"A":…, "B":…},
