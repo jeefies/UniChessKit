@@ -46,6 +46,10 @@ class PUCTConfig:
     max_collision: int = 8          # 一批里同一叶子最多被选中几次
     root_min_visits: int = 1
     root_top_k: int = 0             # 温度采样只在访问数前 K 的根着法里进行（0 = 不限）
+    # 走到本局（含搜索路径）已出现过的局面时按和棋（值 0）结算，不再下探（AlphaZero 口径）。
+    # **默认关**：打开会改变搜索结果，会把 tests/golden/r_mcts 的冻结整树对拍打挂
+    # （那个 fixture 里确实有重复路径）。自对弈生成配置里显式打开。
+    repetition_draw: bool = False
 
 
 class Node:
@@ -147,6 +151,15 @@ class PUCT:
                     child = Node()
                     node.children[i] = child
                 node = child
+                if (cfg.repetition_draw and node.terminal_value is None
+                        and board.is_repetition(2)):
+                    # 这一步走到本局（含搜索路径）里已出现过的局面：按和棋结算。
+                    # AlphaZero 口径。没有它，搜索把重复当普通节点一路下探，
+                    # 两个副本自对弈会互相镜像进三次重复循环（详见
+                    # Kit/players/search_player.py::_avoid_repetition 的实测记录）。
+                    node.expanded = True
+                    node.terminal_value = 0.0
+                    break                           # 交给下面按终局回填
 
             if node.terminal_value is not None:
                 self._backup(path, node.terminal_value)

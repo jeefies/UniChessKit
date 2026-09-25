@@ -19,7 +19,7 @@ import chess
 import numpy as np
 
 from ..api import immediate
-from ..api.types import GameStart, Leaf, MoveDecision, SearchBudget, Think
+from ..api.types import GameStart, Leaf, MoveDecision, PlayerError, SearchBudget, Think
 from ..search.puct import PUCT, PUCTConfig
 
 _ROOT_MAX_SKIP = 4     # 跳过这么多手以上就重建：重放的收益追不上失配的风险
@@ -37,7 +37,7 @@ class SearchPlayer:
     def __init__(self, name: str, expander, *, simulations: int = 0,
                  puct: Optional[PUCTConfig] = None, oracle=None, book=None,
                  book_plies: int = 10, temperature: float = 0.0, reuse_tree: bool = True,
-                 planes_evaluator=None):
+                 planes_evaluator=None, avoid_repetition: bool = True):
         self.name = name
         self.expander = expander
         self.simulations = simulations
@@ -50,6 +50,11 @@ class SearchPlayer:
         self.planes_evaluator = planes_evaluator    # 给出时用 C++ PUCT（search/puct_cpp.py）
         self.new_game_called = False
         self.record_visits = False
+        # 重复规避：最优着法导致重复局面时改选访问数次优的非重复着法（默认开）
+        self.avoid_repetition = bool(avoid_repetition)
+        self._game_book: list = []                  # GameStart.book（开局库强制着法）
+        self._book_len = 0
+        self._ply = 0
         self._reset(0)
 
     # ---------- 生命周期 ----------
@@ -69,6 +74,12 @@ class SearchPlayer:
     def new_game(self, start: GameStart) -> Think[None]:
         self._reset(start.seed)
         self.record_visits = start.both_sides      # 自对弈：决策里带根访问分布（训练目标）
+        # pipelines.selfplay 的 GameStart.book：前若干 ply 原样走出，不搜索。
+        # 这些 ply 没有访问分布，sink 自动跳过，与 polyglot 书的行为一致。
+        # 不认这个字段的话，开局注入会让整批自对弈以 PlayerError 中止。
+        self._game_book = [chess.Move.from_uci(u) for u in start.book]
+        self._book_len = len(self._game_book)
+        self._ply = 0
         self.new_game_called = True
         return immediate(None)
 
@@ -82,19 +93,69 @@ class SearchPlayer:
 
     def choose(self, board: chess.Board, budget: SearchBudget) -> Think[MoveDecision]:
         temperature = self.temperature if budget.temperature is None else budget.temperature
+        self._ply = len(board.move_stack)          # choose 每 ply 调一次，开局库计数以它为准
         mv = self._from_tablebase(board)
         if mv is not None:
             return MoveDecision(mv, "tablebase")
+        if self._ply < self._book_len:               # 开局库着法：原样走，不搜索
+            mv = self._game_book[self._ply]
+            if mv not in board.legal_moves:
+                raise PlayerError(f"{self.name}: 开局库着法 {mv.uci()} 在 "
+                                  f"{board.fen()} 不合法")
+            return MoveDecision(mv, "book")
         mv = self._from_book(board)
         if mv is not None:
             return MoveDecision(mv, "book")
         sims = self.simulations if budget.simulations is None else budget.simulations
         if sims > 0:
-            mv = yield from self._from_search(board, sims, temperature, budget)
+            mv, root = yield from self._from_search(board, sims, temperature, budget)
             if mv is not None and mv in board.legal_moves:
+                mv = self._avoid_repetition(board, mv, root)
                 return MoveDecision(mv, "search", dict(self.last_info))
         mv = yield from self._from_policy(board, temperature)
         return MoveDecision(mv, "policy", dict(self.last_info))
+
+    def _avoid_repetition(self, board: chess.Board, mv: chess.Move, root):
+        """最优着法导致重复局面时，改选访问数次优的非重复着法。
+
+        为什么必须做：自对弈里同一个 Player 执双方，两边都走「搜索认为最好」的一手；
+        而对重复局面的估值在 evals 蒸馏数据上从没训过（输入第 18 通道 rep 恒 0），
+        搜索也把重复当成普通节点，于是两个副本互相镜像进三次重复循环——
+        2026-09-26 实测 64/128/256 sims 全部 16/16 threefold，终局 z 全 0，
+        价值头拿不到任何梯度，生成的数据是废的。
+
+        规则：只在**确有非重复替代**时才改选（所有着法都重复的极端局面仍走最优），
+        按根节点访问数降序取第一个非重复着法；确定性，不引入新的随机数。
+        """
+        if not self.avoid_repetition or root is None:
+            return mv
+        moves = list(getattr(root, "moves", None) or [])
+        if not moves:
+            return mv
+        N, W = root.N, root.W
+        probe = board.copy(stack=True)
+        probe.push(mv)
+        if not probe.is_repetition(2):
+            return mv                             # 最优着法不重复，正常走
+        for i in sorted(range(len(moves)), key=lambda j: -int(N[j])):
+            if N[i] <= 0:
+                break                              # 之后都是没访问过的着法，没有次优可言
+            cand = moves[i]
+            if cand == mv:
+                continue
+            probe = board.copy(stack=True)
+            probe.push(cand)
+            if not probe.is_repetition(2):
+                self._repoint_info(moves, N, W, i)
+                return cand
+        return mv                                  # 全是重复着法：无处可躲
+
+    def _repoint_info(self, moves, N, W, i: int) -> None:
+        """改选了着法：把 info 里的 q / pv 从原最优着法改到实际走的着法。"""
+        info = self.last_info
+        if N[i] > 0:
+            info["q"] = float(W[i]) / float(N[i])
+        info["pv"] = [moves[i].uci()]
 
     def _from_tablebase(self, board: chess.Board) -> Optional[chess.Move]:
         if self.oracle is None:
@@ -130,7 +191,7 @@ class SearchPlayer:
                 add_noise=budget.add_noise, deadline=budget.deadline)
         self._root, self._root_ply, self._root_epd = root, len(board.move_stack), board.epd()
         self.last_info = self._search_info(root)
-        return mv
+        return mv, root
 
     def _from_policy(self, board, temperature) -> Think:
         (ev,) = yield from self.expander.expand([Leaf(board=board)])
@@ -138,6 +199,12 @@ class SearchPlayer:
             raise ValueError(f"{self.name}: 局面没有合法着法 {board.fen()}")
         scores = np.asarray(ev.priors, dtype=np.float64)
         self.last_info = {"value": float(ev.value)}
+        if self._ply < self._book_len:               # 开局库着法同样优先于网络直出
+            mv = self._game_book[self._ply]
+            if mv not in board.legal_moves:
+                raise PlayerError(f"{self.name}: 开局库着法 {mv.uci()} 在 "
+                                  f"{board.fen()} 不合法")
+            return mv
         if temperature <= 0:
             return ev.moves[int(scores.argmax())]
         p = scores ** (1.0 / temperature)

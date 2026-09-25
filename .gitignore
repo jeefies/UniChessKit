@@ -9,10 +9,13 @@ logs/
 *.safetensors
 *.zst
 *.bin
+!Kit/data/*.bin     # polyglot 开局书（自对弈开局注入要用，是数据不是分片）
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
+# 只忽略仓库根目录的 build/。**不要**写成裸 `build/`：那会连
+# planes19/build/（数据构建包，Kit data evals|pgn|annotate|check 的实现）一起忽略掉
+/build/
 *.so
 dist/
 

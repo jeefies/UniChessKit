@@ -3,7 +3,7 @@ from collections import namedtuple
 
 import chess
 
-from Kit.api import GameStart, SearchBudget
+from Kit.api import GameStart, PlayerError, SearchBudget
 from Kit.planes19 import Planes19Expander
 from Kit.players import RandomPlayer, SearchPlayer
 from Kit.rules import TablebaseOracle
@@ -16,6 +16,13 @@ from Kit.tests.test_rules import FakeTablebase
 def search_player(sims=24, **kw):
     return SearchPlayer("s", Planes19Expander(FakePlanesEvaluator()), simulations=sims,
                         puct=PUCTConfig(batch_size=8), **kw)
+
+
+def _board_with_history(ucis):
+    b = chess.Board()
+    for u in ucis:
+        b.push_uci(u)
+    return b
 
 
 class TestRandomContract(PlayerContract, unittest.TestCase):
@@ -113,6 +120,70 @@ class TestSearchPlayer(unittest.TestCase):
         p = search_player(sims=32, temperature=1.0)
         first = [choose(p, chess.Board(), seed=5).move for _ in range(3)]
         self.assertEqual(len(set(first)), 1)       # 每次 new_game 都按同一 seed 重置
+
+    def test_assigned_opening_line_is_played_verbatim(self):
+        """``GameStart.book``（selfplay 的开局注入）：前若干 ply 原样走、不搜索。
+
+        不认这个字段的话，开局注入会让整批自对弈以 PlayerError 中止
+        （实测：应走 e2e4 却走了 h2h3）。这些 ply 没有访问分布，sink 会自动跳过。
+        """
+        p = search_player(sims=32)
+        book = ("e2e4", "e7e5", "g1f3")
+        run_sync(p.new_game(GameStart(color=chess.WHITE, seed=1, book=book)))
+        board = chess.Board()
+        for ply, uci in enumerate(book):
+            d = run_sync(p.choose(board.copy(), SearchBudget()))
+            self.assertEqual(d.move.uci(), uci, f"第 {ply} ply 没走开局库着法")
+            self.assertEqual(d.source, "book")
+            self.assertNotIn("visits", d.info)          # 不搜索 ⇒ 无训练目标
+            board.push(d.move)
+        after = run_sync(p.choose(board.copy(), SearchBudget()))
+        self.assertEqual(after.source, "search")         # 开局之后恢复正常出招链
+        self.assertIn(after.move, board.legal_moves)
+
+    def test_assigned_line_illegal_move_raises(self):
+        p = search_player(sims=8)
+        run_sync(p.new_game(GameStart(color=chess.WHITE, seed=1, book=("e2e4", "e2e5"))))
+        board = chess.Board()
+        run_sync(p.choose(board.copy(), SearchBudget())).move
+        board.push_san("e4")
+        with self.assertRaises(PlayerError):            # 白兵已不在 e2
+            run_sync(p.choose(board.copy(), SearchBudget()))
+
+    def test_avoids_repeating_position_when_alternative_exists(self):
+        """最优着法导致重复局面时改选访问数次优的非重复着法。
+
+        自对弈里同一个 Player 执双方，实测 64/128/256 sims 全部 16/16 三次重复和棋，
+        终局 z 全 0。规避规则只改选着法，不动搜索树，也必须保持确定性。
+        """
+        board = _board_with_history(["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6"])
+        for off in (False, True):
+            p = search_player(sims=64, avoid_repetition=off)
+            run_sync(p.new_game(GameStart(color=chess.WHITE, seed=3)))
+            d = run_sync(p.choose(board.copy(), SearchBudget()))
+            nxt = board.copy(stack=True)
+            nxt.push(d.move)
+            if off:
+                self.assertIn(d.move, board.legal_moves)
+            else:
+                self.assertFalse(nxt.is_repetition(2),
+                                 f"{d.move.uci()} 会重复局面（规避没生效）")
+                self.assertEqual(d.source, "search")
+                # 改选的着法必须在根节点访问数里排得上号，info 的 q/pv 也要指向它
+                self.assertGreater(d.info["sims"], 0)
+                if "q" in d.info:
+                    self.assertTrue(-1.0 <= d.info["q"] <= 1.0)
+
+    def test_repetition_avoidance_is_deterministic(self):
+        """同一开局同一 seed 两次跑出的着法序列必须完全一致（不引入新随机源）。"""
+        board = _board_with_history(["e2e4", "e7e5", "g1f3", "b8c6", "f3g1", "c6b8"])
+        seqs = []
+        for _ in range(2):
+            p = search_player(sims=48)
+            run_sync(p.new_game(GameStart(color=chess.WHITE, seed=11)))
+            seqs.append([run_sync(p.choose(board.copy(), SearchBudget())).move.uci()
+                         for _ in range(3)])
+        self.assertEqual(seqs[0], seqs[1])
 
 
 if __name__ == "__main__":

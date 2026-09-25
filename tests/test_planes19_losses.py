@@ -194,6 +194,32 @@ class TestChessLoss(unittest.TestCase):
         m = L.policy_metrics(logits, t)
         self.assertEqual(float(m["top1"]), 0.0)
 
+    def test_policy_loss_type_switches_objective(self):
+        """``policy_loss_type`` 真的切换目标：kl_divergence 与 cross_entropy 数值不同。
+
+        P4 自对弈配方用 KL（MCTS 访问分布是软目标）；默认仍是 CE。
+        """
+        torch.manual_seed(0)
+        n, moves = 8, 4096
+        pl = torch.randn(n, moves) * 3
+        wl = torch.randn(n, 3)
+        t = torch.zeros(n, moves)
+        t[:, 0] = 0.7
+        t[:, 1] = 0.3
+        pr = torch.full((n,), -100, dtype=torch.int64)
+        w = torch.full((n, 3), -1e9)
+        w[:, 0] = 1.0
+        out = L.ChessLoss()(pl, wl[:, :4], wl, t, pr, w)
+        kl = L.ChessLoss(policy_loss_type="kl_divergence")(pl, wl[:, :4], wl, t, pr, w)
+        self.assertTrue(torch.isfinite(out.policy_loss))
+        self.assertTrue(torch.isfinite(kl.policy_loss))
+        self.assertNotAlmostEqual(float(out.policy_loss), float(kl.policy_loss), places=5)
+        with self.assertRaises(ValueError):
+            L.ChessLoss(policy_loss_type="mse")
+
+    def test_default_policy_loss_type_is_cross_entropy(self):
+        self.assertEqual(L.ChessLoss().policy_loss_type, "cross_entropy")
+
 
 if __name__ == "__main__":
     unittest.main()

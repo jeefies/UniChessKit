@@ -44,18 +44,21 @@ LOSS_KINDS = ("r_stage1", "r_iter", "t_chess")
 
 def resolve_shards(spec: dict) -> list:
     spec = dict(spec)
-    paths = list_shards(spec.pop("dir"), spec.pop("pattern", "*.bin"),
-                        exclude_selfplay=spec.pop("exclude_selfplay", True))
-    sl = spec.pop("slice", None)
     files = spec.pop("files", None)
+    if "dir" in spec:
+        paths = list_shards(spec.pop("dir"), spec.pop("pattern", "*.bin"),
+                            exclude_selfplay=spec.pop("exclude_selfplay", True))
+        sl = spec.pop("slice", None)
+        if sl is not None:
+            paths = paths[slice(*sl)]
+    else:
+        paths = None                              # 只给 files：换代循环按代给出
     if spec:
         raise ValueError(f"shards 有未知字段 {sorted(spec)}")
-    if sl is not None:
-        paths = paths[slice(*sl)]
-    if files is not None:                          # 显式列表（换代循环按代给出）
+    if files is not None:                          # 显式列表（优先于目录枚举）
         paths = [Path(f) for f in files]
     if not paths:
-        raise FileNotFoundError("切片后没有分片")
+        raise FileNotFoundError("没有分片（给 dir 时按目录枚举/切片，给 files 时按显式列表）")
     return paths
 
 
@@ -80,7 +83,7 @@ class Planes19Task:
             raise ValueError(f"loss.kind 应为 {LOSS_KINDS}")
         _check_keys(self.loss_cfg, ("kind", "legal_mask", "check_leak", "value_weight",
                                     "promo_weight", "policy_weight", "wdl_weight", "mlh_weight",
-                                    "mlh"), "loss")
+                                    "mlh", "policy_loss_type"), "loss")
         self.num_buckets = int(getattr(self.adapter, "num_buckets", 1))
         self.channels_last = bool(getattr(self.adapter, "channels_last", False))
         self.state: dict = {}
@@ -88,7 +91,9 @@ class Planes19Task:
         if self.loss_cfg["kind"] == "t_chess":
             lc = self.loss_cfg
             self._chess_loss = ChessLoss(lc.get("policy_weight", 1.0), lc.get("promo_weight", 0.1),
-                                         lc.get("wdl_weight", 1.0), lc.get("mlh_weight", 0.05))
+                                         lc.get("wdl_weight", 1.0), lc.get("mlh_weight", 0.05),
+                                         policy_loss_type=lc.get("policy_loss_type",
+                                                                "cross_entropy"))
         self._val_pool = None
 
     # ------------------------------------------------------------ TrainTask

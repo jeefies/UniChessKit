@@ -646,6 +646,7 @@ struct Ctx {
     double c_base, c_init, fpu_reduction, vl;
     bool claim_draw;
     int max_collision, root_min_visits, oracle_max_pieces;
+    bool repetition_draw = true;   // 走到已出现过的局面按和棋（值 0）结算，不再下探
     // 根局面与对局历史
     Pos root_pos;
     std::vector<Hist> hist;  // 前 root_n 项是对局历史，下探时临时追加路径
@@ -820,6 +821,14 @@ int collect(Ctx& c, int want, float* planes, uint16_t* path_out, int path_cap, i
             pos = push(pos, m);
             if (!node->children[i]) node->children[i] = std::make_shared<Node>();
             node = node->children[i].get();
+            // 这一步走到本局（含搜索路径）里已出现过的局面：按和棋结算（AlphaZero 口径）。
+            // 只标记不在此处回填：下面按 has_term 分支统一 backup，与 Python 版同构。
+            if (c.repetition_draw && !node->has_term &&
+                is_repetition(c.hist, c.hist.size(), key_of(pos), 2)) {
+                node->expanded = true;
+                node->has_term = true;
+                node->term = 0.0;
+            }
         }
         if (node->has_term) {
             backup(c, path, node->term);
@@ -942,7 +951,8 @@ KP_API int kp_abi_version() { return 1; }
 KP_API const char* kp_last_error() { return g_err.c_str(); }
 
 KP_API void* kp_ctx_new(double c_base, double c_init, double fpu_reduction, double vl, int claim_draw,
-                        int max_collision, int root_min_visits, int oracle_max_pieces) {
+                        int max_collision, int root_min_visits, int oracle_max_pieces,
+                        int repetition_draw) {
     KP_TRY
     Ctx* c = new Ctx();
     c->c_base = c_base;
@@ -953,6 +963,7 @@ KP_API void* kp_ctx_new(double c_base, double c_init, double fpu_reduction, doub
     c->max_collision = max_collision;
     c->root_min_visits = root_min_visits;
     c->oracle_max_pieces = oracle_max_pieces;
+    c->repetition_draw = repetition_draw != 0;
     return c;
     KP_CATCH(nullptr)
 }

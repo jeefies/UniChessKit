@@ -149,7 +149,8 @@ class PUCTCpp(PUCT):
         self._ctx = self._lib.kp_ctx_new(float(c.c_puct_base), float(c.c_puct_init),
                                          float(c.fpu_reduction), float(c.virtual_loss),
                                          int(bool(c.claim_draw)), int(c.max_collision),
-                                         int(c.root_min_visits), max_pieces)
+                                         int(c.root_min_visits), max_pieces,
+                                         int(bool(c.repetition_draw)))
         if not self._ctx:
             raise RuntimeError(f"C++ PUCT 初始化失败：{native.last_error()}")
         self._info = (ctypes.c_int * 4)()

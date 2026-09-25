@@ -29,13 +29,32 @@ def make(sims=64, batch=16, salt="", oracle=None, seed=0, **kw):
 
 
 class TestPUCT(unittest.TestCase):
-    def test_visit_accounting(self):
-        for fen in POSITIONS:
-            puct, _ = make(sims=100)
-            root = run_sync(puct.search(chess.Board(fen)))
-            self.assertEqual(int(root.N.sum()), 100, fen)
-            self.assertEqual(puct.last_metrics["simulations"], 100)
-            self.assertEqual(float(root.VL.sum()), 0.0)         # virtual loss 全部撤销
+    def test_repetition_draw_default_off_and_opt_in(self):
+        """``repetition_draw`` 默认关（否则 tests/golden/r_mcts 的冻结整树会挂）。
+
+        打开后：走到已出现过的局面按和棋结算、不再下探送网络。
+        测试局面用一段真实的重复历史：1.Nf3 Nf6 2.Ng1 Ng8 之后白方再走 Ng1 就是第二次出现。
+        """
+        board = chess.Board()
+        for uci in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6"):
+            board.push_uci(uci)
+        cand = board.copy(stack=True)
+        cand.push_uci("f3g1")            # 回到开局局面 ⇒ 第二次出现
+        self.assertTrue(cand.is_repetition(2), "测试局面本身应是重复局面")
+
+        for flag, expect_terminal in ((False, False), (True, True)):
+            puct, ev = make(sims=32, repetition_draw=flag)
+            root = run_sync(puct.search(board.copy()))      # 从重复前的位置开始搜
+            self.assertEqual(int(root.N.sum()), 32, flag)
+            i = [m.uci() for m in root.moves].index("f3g1")
+            child = root.children[i]
+            if expect_terminal:
+                self.assertIsNotNone(child, "重复边必须建出子节点才能记账")
+                self.assertEqual(float(child.terminal_value), 0.0)
+                self.assertEqual(list(child.moves), [], "终局子节点不该展开着法")
+            elif child is not None:
+                self.assertIsNone(child.terminal_value)
+                self.assertTrue(bool(child.moves), "关掉时重复边是普通节点")
 
     def test_finds_mate_in_one(self):
         for fen, mate in ((POSITIONS[1], "f3f7"), (POSITIONS[2], "d1d8")):

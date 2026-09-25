@@ -225,6 +225,36 @@ class TestSearchParity(unittest.TestCase):
                     with self.subTest(fen=board.fen(), q=quantize, **kw):
                         self._compare(board, PUCTConfig(**kw), model)
 
+    def test_repetition_draw_trees_identical(self):
+        """``repetition_draw=True``：走到已出现过的局面按和棋结算，Python 与 C++ 逐位一致。
+
+        三个局面都带重复历史，最后一步把局面走回之前出现过的一次 ⇒ ``is_repetition(2)``。
+        两个实现都必须把那条边建成终局（值 0）且不再下探送网络。
+        """
+        model = FakePlanes19Model("rep")
+        cases = (
+            (["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6"], "f3g1"),
+            (["e2e4", "e7e5", "g1f3", "b8c6", "f3g1", "c6b8"], "g1f3"),
+            (["d2d4", "d7d5", "c1f4", "c8f5", "f4c1", "f5c8"], "c1f4"),
+        )
+        for ucis, repeat in cases:
+            board = _board_with_history(chess.STARTING_FEN, ucis)
+            cand = board.copy(stack=True)
+            cand.push_uci(repeat)
+            self.assertTrue(cand.is_repetition(2), cand.fen())
+            for kw in (dict(simulations=200, batch_size=16),
+                       dict(simulations=200, batch_size=1),
+                       dict(simulations=200, batch_size=16, claim_draw=True, root_min_visits=3)):
+                with self.subTest(moves=tuple(ucis), repeat=repeat, **kw):
+                    py, cc, r1, r2 = self._compare(board, PUCTConfig(repetition_draw=True, **kw),
+                                                   model)
+                    i = [m.uci() for m in r1.moves].index(repeat)
+                    self.assertEqual(float(r1.children[i].terminal_value), 0.0)
+                    self.assertEqual(float(r2.children[i].terminal_value), 0.0)
+                    # 终局子节点没有着法 ⇒ 不会为该局面送网络
+                    self.assertEqual(list(r1.children[i].moves), [])
+                    self.assertEqual(list(r2.children[i].moves), [])
+
     def test_noise(self):
         model = FakePlanes19Model("n")
         for seed in range(3):

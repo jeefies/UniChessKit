@@ -2,15 +2,18 @@
 
 口径移植自 S 的 ``tools/ssm_gumbel_selfplay.py``（Stage B 生成器），逐条对应：
 
-- **开局注入**：第 g 局用开局库第 ``g % 库大小`` 条，裁到 ``book_plies``；这些着法**经 choose 走出**
-  （GameStart.book），Player 照常搜索给出训练目标，管线校验走的正是 book 着法。
-  开局库**不去重**：裁切后重复的线各自保留序号（S 的 ``load_openings`` 如此；去重会改变
-  开局分配，破坏与既有数据的可比性）。非法线丢弃并计数。
+- **开局注入**：第 g 局用开局库第 ``g % 库大小`` 条，裁到 ``book_plies``；这些着法**由 Player 照 book 走**
+   （``GameStart.book``），Player 不搜索、直接给出这一步（没有访问分布，训练目标里跳过）。
+   开局库**不去重**：裁切后重复的线各自保留序号（S 的 ``load_openings`` 如此；去重会改变
+   开局分配，破坏与既有数据的可比性）。非法线丢弃并计数。
 - **分片**：局序号是全局的（``first_game`` 起），开局、随机数流、局键都只取决于全局序号，
-  因此把 N 局拆给多个进程（各取不相交区间、同一 seed）与单进程跑出的是同一批对局。
-- **随机数**：每局的随机数流由 (seed, 局序号) 决定——Player 用
-  ``np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(index,)))``，与 S 的
-  ``SeedSequence(seed).spawn(num_games)[index]`` 逐位相同（见 ``game_seed_sequence``）。
+   因此把 N 局拆给多个进程（各取不相交区间、同一 seed）与单进程跑出的是同一批对局。
+- **随机数**：每局的随机数流由 (seed, 局序号) 决定——管线用 ``game_seed_sequence(seed, 局序号)``
+   为每局派生一个整数种子交给 Player（见 ``_game_seed``），与 S 的
+   ``SeedSequence(seed).spawn(num_games)[index]`` 逐位同源。**Player 只吃一个种子**
+   （``SearchPlayer._reset`` / S 的 Player 都只用 ``start.seed``），所以必须由管线派生：
+   直接传全局 seed 会让同一批所有对局共用一条随机数流、下出同一盘棋（2026-09-26 实测：
+   32 局全部 79-141 ply 三次重复，局面 100% 重合）。
 - **裁决**：rules.StandardReferee（claim_draw 语义；max_plies 按整盘计，含 book）。
 - 出错整批停止（CoroutinePool 语义），Sink 不会收到半局。
 
@@ -65,6 +68,17 @@ class SelfPlayTask:
 def game_seed_sequence(seed: int, index: int) -> np.random.SeedSequence:
     """第 index 局的随机数种子序列（= ``SeedSequence(seed).spawn(n)[index]``）。"""
     return np.random.SeedSequence(int(seed), spawn_key=(int(index),))
+
+
+def _game_seed(seed: int, game: int) -> int:
+    """第 game 局交给 Player 的种子：由 (seed, 局序号) 派生的确定性整数。
+
+    Player 的随机数流只吃一个 int（``SearchPlayer._reset`` 用
+    ``random.Random(seed)`` / ``default_rng(seed)``），所以这里把 ``game_seed_sequence``
+    收敛成一个 32 位整数：局号相同 ⇒ 种子相同（同配置可复现、可按局号拆进程），
+    局号不同 ⇒ 种子不同（同一批对局不会共用随机数流）。
+    """
+    return int(game_seed_sequence(seed, game).generate_state(1, dtype=np.uint32)[0])
 
 
 def load_book_lines(path, book_plies: int) -> tuple:
@@ -168,7 +182,8 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
         if progress is not None:
             progress(record, totals["games"])
 
-    jobs = ((t.game, (lambda t=t: play_selfplay_game(t, make_player(), referee, budget, cfg.seed)))
+    jobs = ((t.game, (lambda t=t: play_selfplay_game(t, make_player(), referee, budget,
+                                                     _game_seed(cfg.seed, t.game))))
             for t in tasks)
     pool.run(jobs, on_done, should_stop=should_stop or (lambda: False))
     elapsed = time.perf_counter() - t0
