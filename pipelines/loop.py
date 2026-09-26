@@ -24,6 +24,11 @@
 它的导出成为本代候选，进最终 arena；``rec["search"]`` 里记录所有变体的成绩。
 续跑粒度到变体：训练导出与筛选赛汇总都在就跳过，中断不重跑已花的 GPU。
 
+**只枚举前 N 代**（``enumerate_generations: 3``）：前 N 代照常枚举，选中变体的覆盖字段
+记进 ``loop_state.json`` 的 ``train_variant``；第 N 代起直接用那份配置训练
+（产物落 ``gen_XXXX/train/``，跳过全部筛选赛）。每代省下的就是 N 场筛选赛的钱。
+不写这个字段 = 每代都枚举。
+
 注意（胜者诅咒）：筛选用小赛场选最优，选出来的那个的 score_a **系统性偏高**，
 所以最终能否换代仍由 ``arena`` 的完整预算判定，不认筛选赛的分数。
 
@@ -37,6 +42,7 @@
       "train":    TrainConfig 模板（out 由循环填）；variants 非空时进入枚举搜索,
       "export":   "final.pt"   （训练目录里作为候选的导出文件名）,
       "arena":    {"match": MatchConfig 字段, "gate": {"kind": "sprt"} | {"kind": "score", "min_score": 0.55}}}
+     "enumerate_generations": 可选，只枚举前 N 代（见「枚举搜索」一节）
 
 模板占位符（字符串整体等于占位符时替换为对应值，可为列表；否则做子串替换）::
 
@@ -59,6 +65,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from .. import IMPORT_ROOT
 from ..runtime.locks import FileLock
@@ -100,7 +107,8 @@ def _write_json(path: Path, obj) -> None:
 class Loop:
     def __init__(self, conf: dict, base_dir: Path, *, python: str = sys.executable):
         unknown = set(conf) - {"out", "generations", "initial", "games", "window", "engine",
-                               "selfplay", "sink", "train", "export", "arena"}
+                               "selfplay", "sink", "train", "export", "arena",
+                               "enumerate_generations"}
         if unknown:
             raise ValueError(f"loop 配置有未知字段 {sorted(unknown)}")
         self.conf = conf
@@ -108,6 +116,11 @@ class Loop:
         self.out = out if out.is_absolute() else (base_dir / out).resolve()
         self.python = python
         self.state_path = self.out / "loop_state.json"
+        self.enumerate_generations = conf.get("enumerate_generations")
+        if self.enumerate_generations is not None:
+            self.enumerate_generations = int(self.enumerate_generations)
+            if self.enumerate_generations < 0:
+                raise ValueError("enumerate_generations 应 >= 0")
         gate = conf["arena"].get("gate", {"kind": "sprt"})
         if gate["kind"] not in ("sprt", "score"):
             raise ValueError("arena.gate.kind 应为 sprt 或 score")
@@ -146,6 +159,18 @@ class Loop:
                 "{candidate}": str(gd / "train" / self.conf.get("export", "final.pt"))}
 
     # ------------------------------------------------------------ 枚举搜索
+    def uses_search(self, g: int) -> bool:
+        """本代是否跑枚举搜索：有 variants，且代数没超过 ``enumerate_generations``。
+
+        ``enumerate_generations = None``（默认）= 每代都枚举；``= 3`` = 只枚举前 3 代，
+        之后按上一代选中变体的配置训练（不再打筛选赛）。
+        """
+        if not self.variants:
+            return False
+        if self.enumerate_generations is None:
+            return True
+        return g < self.enumerate_generations
+
     def _variant_train_conf(self, variant: dict, m: dict) -> dict:
         """base train 模板与 variant 递归合并后做占位符替换；``out`` 按 label 分开。"""
         base = copy.deepcopy(self.conf["train"])
@@ -198,9 +223,20 @@ class Loop:
         _write_json(path, conf)
         self._run("selfplay", path, gd / "selfplay.log")
 
-    def phase_train(self, g: int, m: dict) -> None:
+    def _fixed_train_conf(self, m: dict, overrides: dict) -> dict:
+        """枚举次数用完后，按锁定的变体配置训练（无筛选赛，产物落 ``gen_XXXX/train/``）。"""
+        base = copy.deepcopy(self.conf["train"])
+        base.pop("variants", None)
+        base.pop("screen", None)
+        conf = _merge(base, overrides)
+        conf["out"] = str(Path(m["{gen_dir}"]) / "train")
+        return _subst(conf, m)
+
+    def phase_train(self, g: int, m: dict, overrides: Optional[dict] = None) -> None:
+        """单路径训练：``overrides`` 给出时按锁定的变体配置训练（枚举已结束）。"""
         gd = self.gen_dir(g)
-        conf = _subst(self.conf["train"], m)
+        conf = (self._fixed_train_conf(m, overrides) if overrides
+                else _subst(self._base_train(), m))
         conf["out"] = str(gd / "train")
         path = gd / "train.json"
         _write_json(path, conf)
@@ -208,6 +244,21 @@ class Loop:
         cand = Path(m["{candidate}"])
         if not cand.exists():
             raise RuntimeError(f"训练结束但没有导出 {cand}")
+
+    def _base_train(self) -> dict:
+        """train 模板去掉枚举搜索专用字段（variants / screen 不是 TrainConfig 的键）。"""
+        base = copy.deepcopy(self.conf["train"])
+        base.pop("variants", None)
+        base.pop("screen", None)
+        return base
+
+    def _selected_variant_config(self, g: int) -> dict:
+        """本代选中变体的覆盖字段（去掉 label），供后续代锁定使用。"""
+        res = self._search_results(g)
+        label = res.get("_selected")
+        if not label:
+            return {}
+        return {k: v for k, v in res[label]["config"].items()}
 
     def _search_all(self, g: int, m: dict) -> str:
         """逐个变体：训练 → 对冠军筛选赛 → 记录结果。返回得分最高变体的 label。
@@ -308,7 +359,7 @@ class Loop:
                 t0 = time.time()
                 if st["phase"] == "selfplay":
                     self.phase_selfplay(g, m)
-                    st["phase"] = "search" if self.variants else "train"
+                    st["phase"] = "search" if self.uses_search(g) else "train"
                     _write_json(self.state_path, st)
                     m = self.mapping(g, st["champion"])      # 本代分片现在才存在
                 if st["phase"] == "search":
@@ -317,10 +368,12 @@ class Loop:
                                                                                "final.pt")
                     m = {**m, "{candidate}": str(picked)}
                     st["variant"] = label
+                    st["train_variant"] = self._selected_variant_config(g)
                     st["phase"] = "arena"
                     _write_json(self.state_path, st)
                 if st["phase"] == "train":
-                    self.phase_train(g, m)
+                    # 枚举已结束的代：按上一代选中变体的配置训练（search 里不再跑筛选赛）
+                    self.phase_train(g, m, st.get("train_variant") or None)
                     st["phase"] = "arena"
                     _write_json(self.state_path, st)
                 if st["phase"] == "arena":

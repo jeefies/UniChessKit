@@ -286,5 +286,65 @@ class TestVariantSearchConfig(unittest.TestCase):
         self.assertEqual(loop.variants, [])
 
 
+class TestEnumerateGenerations(unittest.TestCase):
+    """只枚举前 N 代：uses_search 的判定、锁定配置的构造与读取。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
+
+    def test_default_is_always_enumerate(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        self.assertIsNone(loop.enumerate_generations)
+        self.assertTrue(all(loop.uses_search(g) for g in range(6)))
+
+    def test_first_n_only(self):
+        loop = Loop(_variant_conf(self.tmp, enumerate_generations=3), self.tmp)
+        self.assertEqual([loop.uses_search(g) for g in range(5)],
+                         [True, True, True, False, False])
+        loop0 = Loop(_variant_conf(self.tmp, enumerate_generations=0), self.tmp)
+        self.assertFalse(loop0.uses_search(0))
+        with self.assertRaises(ValueError):
+            Loop(_variant_conf(self.tmp, enumerate_generations=-1), self.tmp)
+
+    def test_fixed_conf_uses_locked_overrides(self):
+        loop = Loop(_variant_conf(self.tmp, enumerate_generations=3), self.tmp)
+        m = loop.mapping(4, "/w/champ.pt")
+        got = loop._fixed_train_conf(m, {"optimizer": {"lr": 1e-06}, "steps": 600})
+        self.assertEqual(got["steps"], 600)                       # 锁定配置生效
+        self.assertEqual(got["optimizer"]["lr"], 1e-06)
+        self.assertEqual(got["optimizer"]["weight_decay"], 0.0001)  # 未覆盖的仍在
+        self.assertEqual(got["out"], str(loop.gen_dir(4) / "train"))  # 不是 train_<label>
+        self.assertNotIn("variants", got)
+        self.assertNotIn("screen", got)
+        self.assertEqual(got["task"]["kwargs"]["base"], "/w/champ.pt")
+
+    def test_selected_variant_config_roundtrip(self):
+        loop = Loop(_variant_conf(self.tmp, enumerate_generations=3), self.tmp)
+        gd = loop.gen_dir(0)
+        gd.mkdir(parents=True, exist_ok=True)
+        (gd / "search.json").write_text(json.dumps({
+            "lr1e-6_s600": {"label": "lr1e-6_s600",
+                            "config": {"optimizer": {"lr": 1e-06}, "steps": 600},
+                            "score_a": 0.4},
+            "lr1e-5_s600": {"label": "lr1e-5_s600",
+                            "config": {"optimizer": {"lr": 1e-05}, "steps": 600},
+                            "score_a": 0.62},
+            "lr1e-5_s1200": {"label": "lr1e-5_s1200",
+                             "config": {"optimizer": {"lr": 1e-05}, "steps": 1200},
+                             "score_a": 0.55},
+            "_selected": "lr1e-5_s600"}), encoding="utf-8")
+        self.assertEqual(loop._selected_variant_config(0),
+                         {"optimizer": {"lr": 1e-05}, "steps": 600})
+        self.assertEqual(loop._selected_variant_config(1), {})     # 没跑过搜索的代
+
+    def test_base_train_strips_search_only_keys(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        base = loop._base_train()
+        self.assertNotIn("variants", base)
+        self.assertNotIn("screen", base)
+        self.assertEqual(base["steps"], 5)                        # 模板本身没被改
+        self.assertIn("variants", loop.conf["train"])
+
+
 if __name__ == "__main__":
     unittest.main()
