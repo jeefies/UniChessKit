@@ -7,20 +7,36 @@
 
 1. **selfplay**：冠军权重自对弈 ``games`` 局 → ``gen_XXXX/selfplay/``。全局局号从
    ``g * games`` 起，不同代的随机数流与开局分配互不重复。
-2. **train**：从冠军权重初始化训练（训练配置模板里的占位符被替换，见下）→ ``gen_XXXX/train/``。
-3. **arena**：候选（训练导出的权重）对冠军 → ``gen_XXXX/arena.jsonl``；
+2. **train** 或 **search**：默认只有一个训练配置模板（``gen_XXXX/train/``）。
+   若 ``train.variants`` 非空则改为**枚举搜索**，见下。
+3. **arena**：候选（胜出变体导出的权重）对冠军 → ``gen_XXXX/arena.jsonl``；
    ``gate.kind = "sprt"``（match 配置须带 sprt，裁决 H1 才换代）或 ``"score"``（``score_a ≥ min_score``）。
+
+**枚举搜索**（``train.variants`` 非空时启用，取代单一训练）::
+
+    "train": {<TrainConfig 模板>, "variants": [{"label": "...", ...覆盖字段...}, ...],
+              "screen": {"pairs": 64, ...MatchConfig 字段...}}
+
+逐个变体：先用模板与 variant **递归合并**（variant 只写要改的键，如
+``{"optimizer": {"lr": 1e-5}, "steps": 800}``）→ 训练到 ``gen_XXXX/train_<label>/``
+→ 与当前冠军跑一场筛选赛 → ``gen_XXXX/screen_<label>.jsonl``。
+全部跑完后按 **筛选赛 score_a** 取最高者（同分比 elo、再比局数），
+它的导出成为本代候选，进最终 arena；``rec["search"]`` 里记录所有变体的成绩。
+续跑粒度到变体：训练导出与筛选赛汇总都在就跳过，中断不重跑已花的 GPU。
+
+注意（胜者诅咒）：筛选用小赛场选最优，选出来的那个的 score_a **系统性偏高**，
+所以最终能否换代仍由 ``arena`` 的完整预算判定，不认筛选赛的分数。
 
 配置::
 
-    {"out": "runs/loop_p4", "generations": 10, "initial": "<冠军权重路径>",
-     "games": 2000, "window": 4,
-     "engine":   EngineSpec 模板（自对弈与 arena 双方共用），
-     "selfplay": SelfPlayConfig 字段（games / first_game 由循环填），
-     "sink":     {"factory": ..., "kwargs": {...}}   （path 等可用占位符）,
-     "train":    TrainConfig 模板（out 由循环填）,
-     "export":   "final.pt"   （训练目录里作为候选的导出文件名）,
-     "arena":    {"match": MatchConfig 字段, "gate": {"kind": "sprt"} | {"kind": "score", "min_score": 0.55}}}
+     {"out": "runs/loop_p4", "generations": 10, "initial": "<冠军权重路径>",
+      "games": 2000, "window": 4,
+      "engine":   EngineSpec 模板（自对弈与 arena 双方共用），
+      "selfplay": SelfPlayConfig 字段（games / first_game 由循环填），
+      "sink":     {"factory": ..., "kwargs": {...}}   （path 等可用占位符）,
+      "train":    TrainConfig 模板（out 由循环填）；variants 非空时进入枚举搜索,
+      "export":   "final.pt"   （训练目录里作为候选的导出文件名）,
+      "arena":    {"match": MatchConfig 字段, "gate": {"kind": "sprt"} | {"kind": "score", "min_score": 0.55}}}
 
 模板占位符（字符串整体等于占位符时替换为对应值，可为列表；否则做子串替换）::
 
@@ -47,7 +63,17 @@ from pathlib import Path
 from .. import IMPORT_ROOT
 from ..runtime.locks import FileLock
 
-PHASES = ("selfplay", "train", "arena")
+PHASES = ("selfplay", "train", "search", "arena")
+
+
+def _merge(base, over):
+    """递归合并：variant 只写要覆盖的键（如 ``{"optimizer": {"lr": 1e-5}}``）。"""
+    if isinstance(base, dict) and isinstance(over, dict):
+        out = dict(base)
+        for k, v in over.items():
+            out[k] = _merge(base.get(k), v) if k in base else copy.deepcopy(v)
+        return out
+    return copy.deepcopy(over)
 
 
 def _subst(obj, mapping: dict):
@@ -87,6 +113,16 @@ class Loop:
             raise ValueError("arena.gate.kind 应为 sprt 或 score")
         if gate["kind"] == "sprt" and not conf["arena"]["match"].get("sprt"):
             raise ValueError("gate = sprt 时 arena.match 必须配置 sprt")
+        self.variants = list(conf["train"].get("variants") or [])
+        if self.variants:
+            labels = [v.get("label") for v in self.variants]
+            if any(not lab for lab in labels):
+                raise ValueError("train.variants 每项都要有 label")
+            if len(set(labels)) != len(labels):
+                raise ValueError(f"train.variants 的 label 重复：{labels}")
+            screen = conf["train"].get("screen") or {}
+            if not screen.get("pairs"):
+                raise ValueError("用 variants 时必须给 train.screen.pairs（候选对冠军的筛选赛场数）")
 
     # ---------------------------------------------------------------- 状态
     def load_state(self) -> dict:
@@ -109,7 +145,35 @@ class Loop:
                 "{selfplay_dir}": str(gd / "selfplay"), "{selfplay_files}": files,
                 "{candidate}": str(gd / "train" / self.conf.get("export", "final.pt"))}
 
+    # ------------------------------------------------------------ 枚举搜索
+    def _variant_train_conf(self, variant: dict, m: dict) -> dict:
+        """base train 模板与 variant 递归合并后做占位符替换；``out`` 按 label 分开。"""
+        base = copy.deepcopy(self.conf["train"])
+        base.pop("variants", None)
+        base.pop("screen", None)
+        conf = _merge(base, variant)
+        conf.pop("label", None)
+        conf["out"] = str(Path(m["{gen_dir}"]) / f"train_{variant['label']}")
+        return _subst(conf, m)
+
+    def _screen_conf(self, m: dict, label: str) -> dict:
+        """一个候选对当前冠军的筛选赛：a=候选，b=冠军，match 取自 ``train.screen``。"""
+        gd = Path(m["{gen_dir}"])
+        cand = gd / f"train_{label}" / self.conf.get("export", "final.pt")
+        a = _subst(self.conf["engine"], {**m, "{weights}": str(cand)})
+        a["label"] = label
+        b = _subst(self.conf["engine"], m)
+        b["label"] = "champion"
+        return {"a": a, "b": b, "match": dict(self.conf["train"]["screen"])}
+
     # ---------------------------------------------------------------- 子进程
+    def _search_results(self, g: int) -> dict:
+        """本代枚举搜索的结果表（含 ``_selected``）；没有则返回空。"""
+        path = self.gen_dir(g) / "search.json"
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def _run(self, subcmd: str, cfg_path: Path, log_path: Path, extra=()) -> None:
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join([str(IMPORT_ROOT)] +
@@ -145,6 +209,71 @@ class Loop:
         if not cand.exists():
             raise RuntimeError(f"训练结束但没有导出 {cand}")
 
+    def _search_all(self, g: int, m: dict) -> str:
+        """逐个变体：训练 → 对冠军筛选赛 → 记录结果。返回得分最高变体的 label。
+
+        每个变体的产物落在 ``gen_XXXX/train_<label>/`` 与 ``gen_XXXX/screen_<label>.jsonl``；
+        两者都存在即视为已做完（续跑跳过），中断后不必重跑已花的 GPU。
+        """
+        gd = self.gen_dir(g)
+        gd.mkdir(parents=True, exist_ok=True)
+        done_path = gd / "search.json"
+        results = (json.loads(done_path.read_text(encoding="utf-8")) if done_path.exists()
+                   else {})
+        results.pop("_selected", None)
+        for variant in self.variants:
+            label = variant["label"]
+            if label in results:
+                continue
+            train_dir = gd / f"train_{label}"
+            export = train_dir / self.conf.get("export", "final.pt")
+            if not export.exists():
+                path = gd / f"train_{label}.json"
+                _write_json(path, self._variant_train_conf(variant, m))
+                self._run("train", path, gd / f"train_{label}.log")
+            if not export.exists():
+                raise RuntimeError(f"变体 {label} 训练结束但没有导出 {export}")
+            scr = gd / f"screen_{label}.jsonl"
+            if not scr.with_name(scr.name + ".summary.json").exists():
+                path = gd / f"screen_{label}.json"
+                _write_json(path, self._screen_conf(m, label))
+                self._run("match", path, gd / f"screen_{label}.log",
+                          ("--out", str(scr), "--quiet"))
+            summary = json.loads(scr.with_name(scr.name + ".summary.json")
+                                 .read_text(encoding="utf-8"))
+            rec = {"label": label,
+                   "config": {k: v for k, v in variant.items() if k != "label"},
+                   "games": summary.get("games"), "score_a": summary.get("score_a"),
+                   "elo": summary.get("elo"), "a_wins": summary.get("a_wins"),
+                   "draws": summary.get("draws"), "b_wins": summary.get("b_wins"),
+                   "distinct_games": summary.get("distinct_games"),
+                   "elapsed_s": summary.get("elapsed_s")}
+            train_log = train_dir / "train.jsonl"
+            if train_log.exists():
+                rows = [json.loads(l) for l in
+                        train_log.read_text(encoding="utf-8").splitlines() if '"loss"' in l]
+                if rows:
+                    rec["train"] = {"steps": len(rows), "first_loss": rows[0]["loss"],
+                                    "last_loss": rows[-1]["loss"],
+                                    "last_policy": rows[-1].get("policy"),
+                                    "last_value": rows[-1].get("value")}
+            results[label] = rec
+            _write_json(done_path, results)
+        if len(results) != len(self.variants):
+            raise RuntimeError(f"变体结果不齐：有 {len(results)}，应有 {len(self.variants)}")
+        best = max(results.values(),
+                   key=lambda r: (r["score_a"] or 0.0, r["elo"] or 0.0, r["games"] or 0))
+        _write_json(done_path, {**results, "_selected": best["label"]})
+        return best["label"]
+
+    def phase_search(self, g: int, m: dict) -> str:
+        """跑完所有变体并选出一个；``{candidate}`` 改指获胜变体的导出。"""
+        label = self._search_all(g, m)
+        gd = self.gen_dir(g)
+        cand = gd / f"train_{label}" / self.conf.get("export", "final.pt")
+        self.selected_variant = label
+        return str(cand)
+
     def phase_arena(self, g: int, m: dict) -> dict:
         gd = self.gen_dir(g)
         a = _subst(self.conf["engine"], {**m, "{weights}": m["{candidate}"]})
@@ -179,9 +308,17 @@ class Loop:
                 t0 = time.time()
                 if st["phase"] == "selfplay":
                     self.phase_selfplay(g, m)
-                    st["phase"] = "train"
+                    st["phase"] = "search" if self.variants else "train"
                     _write_json(self.state_path, st)
                     m = self.mapping(g, st["champion"])      # 本代分片现在才存在
+                if st["phase"] == "search":
+                    label = self._search_all(g, m)
+                    picked = self.gen_dir(g) / f"train_{label}" / self.conf.get("export",
+                                                                               "final.pt")
+                    m = {**m, "{candidate}": str(picked)}
+                    st["variant"] = label
+                    st["phase"] = "arena"
+                    _write_json(self.state_path, st)
                 if st["phase"] == "train":
                     self.phase_train(g, m)
                     st["phase"] = "arena"
@@ -194,6 +331,12 @@ class Loop:
                            "elo": summary.get("elo"), "games": summary.get("games"),
                            "sprt": (summary.get("sprt") or {}).get("verdict"),
                            "sec": round(time.time() - t0, 1)}
+                    if self.variants:
+                        rec["variant"] = st.get("variant")
+                        rec["search"] = {k: {"score_a": v["score_a"], "elo": v["elo"],
+                                             "games": v["games"]}
+                                         for k, v in self._search_results(g).items()
+                                         if not k.startswith("_")}
                     if promoted:
                         st["champion"] = m["{candidate}"]
                     st["history"].append(rec)

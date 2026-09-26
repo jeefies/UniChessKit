@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -32,7 +33,8 @@ def _conf(tmp: Path, **kw) -> dict:
         "selfplay": {"games": 0, "first_game": 0, "concurrency": 4},
         "sink": {"factory": "No.such:Sink", "kwargs": {"path": "{selfplay_dir}/s.sp.bin"}},
         "train": {"task": {"factory": "No.such:make_task", "kwargs": {"base": "{weights}"}},
-                  "steps": 5, "device": "cpu"},
+                  "steps": 5, "device": "cpu",
+                  "optimizer": {"lr": 5e-06, "weight_decay": 0.0001, "betas": [0.9, 0.999]}},
         "export": "final.pt",
         "arena": {"match": {"pairs": 4, "simulations": 2400,
                             "sprt": {"elo0": 0.0, "elo1": 40.0, "alpha": 0.05, "beta": 0.1}},
@@ -130,6 +132,16 @@ class TestPromote(unittest.TestCase):
         self.assertFalse(loop.promote({"sprt": None}))           # 没配 sprt ⇒ 不换代
 
 
+def _two_variant_conf(tmp: Path) -> dict:
+    """只含两个已备好产物的变体，用于验证续跑跳过。"""
+    conf = _conf(tmp)
+    train = conf["train"]
+    train["variants"] = [{"label": "a", "optimizer": {"lr": 1e-05}},
+                         {"label": "b", "optimizer": {"lr": 2e-05}}]
+    train["screen"] = {"pairs": 4, "seed": 5, "max_plies": 60, "concurrency": 2}
+    return conf
+
+
 class TestLoopState(unittest.TestCase):
     def test_default_and_roundtrip(self):
         tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
@@ -146,6 +158,132 @@ class TestLoopState(unittest.TestCase):
         self.assertEqual((st["generation"], st["phase"], st["champion"]),
                          (2, "arena", "/w/gen1.pt"))
         self.assertEqual(len(st["history"]), 1)
+
+
+def _variant_conf(tmp: Path, **kw) -> dict:
+    """带枚举搜索的 loop 配置（3 个变体）。"""
+    conf = _conf(tmp)
+    train = conf["train"]
+    train["variants"] = [{"label": "lr1e-5", "optimizer": {"lr": 1e-05}, "steps": 800},
+                         {"label": "lr5e-6", "optimizer": {"lr": 5e-06}},
+                         {"label": "lr1e-6", "optimizer": {"lr": 1e-06}, "steps": 1500}]
+    train["screen"] = {"pairs": 4, "seed": 5, "max_plies": 60, "concurrency": 2}
+    conf.update(kw)
+    return conf
+
+
+class TestVariantSearchConfig(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
+
+    def test_variants_require_labels_and_screen(self):
+        with self.assertRaises(ValueError):
+            Loop(_variant_conf(self.tmp, train={"task": {"factory": "x:y"}, "steps": 1,
+                                                "variants": [{"optimizer": {"lr": 1}}]}),
+                self.tmp)
+        dup = _variant_conf(self.tmp)
+        dup["train"]["variants"][1]["label"] = "lr1e-5"
+        with self.assertRaises(ValueError):
+            Loop(dup, self.tmp)
+        no_screen = _variant_conf(self.tmp)
+        no_screen["train"].pop("screen")
+        with self.assertRaises(ValueError):
+            Loop(no_screen, self.tmp)
+
+    def test_merge_is_recursive_and_leaves_base_intact(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        m = loop.mapping(0, "/w/champ.pt")
+        base = copy.deepcopy(loop.conf["train"])
+        got = loop._variant_train_conf(loop.variants[0], m)
+        self.assertEqual(got["steps"], 800)                       # variant 覆盖
+        self.assertEqual(got["optimizer"]["lr"], 1e-05)           # 递归合并
+        self.assertEqual(got["optimizer"]["weight_decay"], 0.0001)  # 未覆盖的保留
+        self.assertEqual(got["optimizer"]["betas"], [0.9, 0.999])   # 无关键不动
+        self.assertEqual(got["out"], str(loop.gen_dir(0) / "train_lr1e-5"))
+        self.assertNotIn("label", got)
+        self.assertNotIn("variants", got)
+        self.assertNotIn("screen", got)
+        self.assertEqual(loop.conf["train"], base)                # 原配置未被改动
+
+    def test_variant_placeholders_substituted(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        m = loop.mapping(2, "/w/champ.pt")
+        got = loop._variant_train_conf(loop.variants[1], m)
+        self.assertEqual(got["task"]["kwargs"]["base"], "{weights}".replace("{weights}",
+                                                                            "/w/champ.pt"))
+        self.assertEqual(got["steps"], 5)                         # 模板默认步数
+        self.assertEqual(got["optimizer"]["lr"], 5e-06)
+
+    def test_screen_conf_is_candidate_vs_champion(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        m = loop.mapping(1, "/w/champ.pt")
+        c = loop._screen_conf(m, "lr5e-6")
+        cand = str(loop.gen_dir(1) / "train_lr5e-6" / "final.pt")
+        self.assertEqual(c["a"]["kwargs"]["checkpoint"], cand)
+        self.assertEqual(c["a"]["label"], "lr5e-6")
+        self.assertEqual(c["b"]["kwargs"]["checkpoint"], "/w/champ.pt")
+        self.assertEqual(c["b"]["label"], "champion")
+        self.assertEqual(c["match"]["pairs"], 4)
+        self.assertEqual(c["match"]["seed"], 5)
+
+    def test_search_picks_highest_score(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        gd = loop.gen_dir(0)
+        gd.mkdir(parents=True, exist_ok=True)
+        (gd / "search.json").write_text(json.dumps({
+            "lr1e-5": {"label": "lr1e-5", "score_a": 0.52, "elo": 5.0, "games": 8},
+            "lr5e-6": {"label": "lr5e-6", "score_a": 0.62, "elo": 88.0, "games": 8},
+            "lr1e-6": {"label": "lr1e-6", "score_a": 0.55, "elo": 30.0, "games": 8},
+            "_selected": "lr1e-6"}), encoding="utf-8")
+        self.assertEqual(loop._search_all(0, loop.mapping(0, "/w/c.pt")), "lr5e-6")
+        self.assertEqual(loop._search_results(0)["_selected"], "lr5e-6")
+
+    def test_search_tie_breaks_by_elo_then_games(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        gd = loop.gen_dir(0)
+        gd.mkdir(parents=True, exist_ok=True)
+        # 三个变体都要有结果，否则 _search_all 会去真跑缺的那个
+        (gd / "search.json").write_text(json.dumps({
+            "lr1e-5": {"label": "lr1e-5", "score_a": 0.60, "elo": 10.0, "games": 8},
+            "lr5e-6": {"label": "lr5e-6", "score_a": 0.60, "elo": 40.0, "games": 8},
+            "lr1e-6": {"label": "lr1e-6", "score_a": 0.60, "elo": 40.0, "games": 12}}),
+            encoding="utf-8")
+        self.assertEqual(loop._search_all(0, loop.mapping(0, "/w/c.pt")), "lr1e-6")
+
+    def test_search_resume_skips_finished_variants(self):
+        """训练导出 + 筛选赛汇总都在的变体必须跳过（不重跑 GPU）。"""
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        gd = loop.gen_dir(0)
+        gd.mkdir(parents=True, exist_ok=True)
+        for label in ("lr1e-5", "lr5e-6"):
+            (gd / f"train_{label}").mkdir(parents=True, exist_ok=True)
+            (gd / f"train_{label}" / "final.pt").write_bytes(b"\0")
+            (gd / f"screen_{label}.jsonl.summary.json").write_text(
+                json.dumps({"games": 8, "score_a": 0.5 + 0.01 * len(label),
+                            "elo": len(label)}), encoding="utf-8")
+        # 第三个变体缺产物：真跑会失败，所以这里只验证前两个被读回而不是重跑
+        res = loop._search_results(0)
+        self.assertEqual(res, {})                     # 还没写 search.json
+        loop._search_all.__self__  # noqa: B018  (仅确认方法在)
+        # 手工模拟：只给前两个 variant 的配置，验证读取逻辑
+        two = Loop(_variant_conf(self.tmp, train=None) if False else
+                   _two_variant_conf(self.tmp), self.tmp)
+        two_gd = two.gen_dir(0)
+        for label in ("a", "b"):
+            (two_gd / f"train_{label}").mkdir(parents=True, exist_ok=True)
+            (two_gd / f"train_{label}" / "final.pt").write_bytes(b"\0")
+            (two_gd / f"screen_{label}.jsonl.summary.json").write_text(
+                json.dumps({"games": 8, "score_a": 0.6 if label == "b" else 0.4,
+                            "elo": 3.0}), encoding="utf-8")
+        self.assertEqual(two._search_all(0, two.mapping(0, "/w/c.pt")), "b")
+
+    def test_search_results_missing_is_empty(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        self.assertEqual(loop._search_results(0), {})
+
+    def test_no_variants_uses_single_train(self):
+        loop = Loop(_conf(self.tmp), self.tmp)
+        self.assertEqual(loop.variants, [])
 
 
 if __name__ == "__main__":
