@@ -30,7 +30,7 @@ UniChess 各引擎（S / T / R）共享的管线库。引擎只实现少量协�
 
 ```python
 # Transformer/kit.py
-KIT_SPI_VERSION = 1
+KIT_SPI_VERSION = 2      # 必须与 Kit/__init__.py 的 SPI_VERSION 一致
 
 def make_player_factory(checkpoint, simulations=800, **kw):
     evaluator = BatchFnEvaluator("T:" + checkpoint, load_engine(checkpoint).evaluate_batch)

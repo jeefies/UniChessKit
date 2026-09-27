@@ -63,6 +63,37 @@ class TestRegistry(unittest.TestCase):
         with self.assertRaisesRegex(RegistryError, "KIT_SPI_VERSION"):
             load_object("kitreg_s:f", str(root))
 
+    def test_sibling_engines_declare_current_spi(self):
+        """import 根下各引擎仓的 kit.py 声明的 SPI 版本必须与 kit 一致。
+
+        2026-09-27 事故：扁平化把 Kit 的 SPI_VERSION 提到 2，只改了 ResNet，
+        SSM 停在 1 → Server 竞技场一启动就 RegistryError（普通对局走 engine.py 不经过
+        registry，所以线上一直没发现）。用 ast 读字面量、不 import，省得拖 torch。
+        """
+        import ast
+
+        from Kit import IMPORT_ROOT, SPI_VERSION
+
+        checked = 0
+        for repo in sorted(p for p in IMPORT_ROOT.iterdir() if p.is_dir()):
+            path = repo / "kit.py"
+            if not path.exists():
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            declared = None
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == "KIT_SPI_VERSION"
+                        for t in node.targets):
+                    declared = ast.literal_eval(node.value)
+            if declared is None:
+                continue                      # 未声明 = 缺省取 kit 的版本号（合法）
+            self.assertEqual(declared, SPI_VERSION,
+                             f"{repo.name}/kit.py 声明 KIT_SPI_VERSION={declared}，"
+                             f"kit 为 {SPI_VERSION}——两边的版本号要一起改")
+            checked += 1
+        self.assertGreaterEqual(checked, 2, "至少应覆盖 SSM 与 Transformer/ResNet 两个引擎仓")
+
     def test_errors(self):
         with self.assertRaises(RegistryError):
             load_object("no_colon")

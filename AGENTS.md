@@ -42,9 +42,16 @@ S 的编码在 `SSM/` 自己那边）。
 - GPU 租约目录：`$UNICHESS_GPU_LEASE_DIR`（默认 `~/.cache/unichess/gpu_leases`）。
 - import 根：`$UNICHESS_IMPORT_ROOT`（旧名 `UNICHESS_KIT_ROOT` 仍兼容）。**扁平布局后它指的是
   `~/UniChess`，不是本仓库目录**——挂在 `sys.path` 上才能 `import Kit` / `import ResNet`。
-- 引擎插件协议版本 `SPI_VERSION = 1`；引擎方在模块级声明 `KIT_SPI_VERSION`
-  （不一致则拒绝加载）。现状：**ResNet 声明 2**（扁平化时提升过，见 `ResNet/kit.py`），
-  Transformer / SSM 仍是 1。
+- 引擎插件协议版本 `SPI_VERSION = 2`；引擎方在模块级声明 `KIT_SPI_VERSION`
+  （不一致则拒绝加载）。现状：**ResNet / Transformer / SSM 都显式声明 2**。
+  **改 Kit 的版本号时必须同时改三个引擎仓**——`test_registry` 会用 ast 扫 import 根下各
+  `kit.py` 的字面量并对账，漏一个当场红。2026-09-27 就出过这事：扁平化把 1 提到 2 时只改了
+  ResNet，SSM 停在 1，Server 竞技场一启动就 `RegistryError`（普通对局走 `engine.py` 不经过
+  registry，所以线上一直没暴露）。
+- 注意「普通对局」和「竞技场/观战」是两条加载路径：`Server/models/__init__.py` 按文件路径
+  加载 `engine.py` 直连六方法（不过 registry、无 SPI 检查）；`Server/jobs.py` 为观战和批量对弈
+  建 `EngineSpec` 走 `registry.load_object`（有 SPI 检查，并按 `{"preset": <arg>}` 调用工厂）。
+  新引擎接入时**两条都要验**。
 
 ## 测试
 
