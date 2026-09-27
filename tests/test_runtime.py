@@ -1,7 +1,10 @@
+import multiprocessing as mp
+import os
 import unittest
 
 from Kit.api import EvalRequest, immediate
 from Kit.runtime import Batcher, CoroutinePool, WorkerError, WorkerPool, run_sync
+from Kit.runtime.workers import _entry
 from Kit.testing import fakes
 
 
@@ -145,6 +148,61 @@ class TestWorkerPool(unittest.TestCase):
         got = []
         with self.assertRaisesRegex(WorkerError, "静默退出"):
             WorkerPool(poll_s=0.2).run(fakes.crash_worker, [None], lambda w, x: got.append(x))
+
+
+def _spin_worker(wid, task, emit, stop_event):
+    """一直转到 stop_event 被置（模拟正在跑一局长赛的 match worker）。"""
+    while not stop_event.is_set():
+        stop_event.wait(0.1)
+    emit("stopped")
+
+
+class TestParentDeathWatchdog(unittest.TestCase):
+    """父进程死后 worker 必须自己退，不能当孤儿占着 GPU 显存。
+
+    2026-09-26 实测：``Kit match --workers 2`` 的 worker cmdline 是
+    ``multiprocessing.spawn``，父进程被 kill 后它们被过继给 init 继续占显存，
+    攒到 4 个（约 5G）把后续的训练直接 OOM。
+    """
+
+    def test_parent_gone_detects_pipe_eof(self):
+        from Kit.runtime.workers import _parent_gone
+        ctx = mp.get_context("spawn")
+        r, w = ctx.Pipe(False)
+        try:
+            self.assertFalse(_parent_gone(r, os.getppid()))     # 写端开着 = 父进程活着
+        finally:
+            w.close()
+        self.assertTrue(_parent_gone(r, os.getppid()))          # 写端关了 = 父进程没了
+
+    def test_parent_gone_ppid_fallback(self):
+        from Kit.runtime.workers import _parent_gone
+        self.assertFalse(_parent_gone(None, os.getppid()))
+        self.assertTrue(_parent_gone(None, -12345))             # ppid 变了即视为没父进程
+
+    def test_worker_exits_after_parent_pipe_closed(self):
+        """真进程回归：关掉父进程侧写端后，worker 必须在宽限内自己退出。"""
+        ctx = mp.get_context("spawn")
+        q, stop_event = ctx.Queue(), ctx.Event()
+        alive_r, alive_w = ctx.Pipe(False)
+        p = ctx.Process(target=_entry, args=(_spin_worker, 0, None, q, stop_event, alive_r),
+                        daemon=True)
+        p.start()
+        try:
+            self.assertTrue(p.is_alive())
+            alive_w.close()                       # 等价于父进程死亡
+            p.join(timeout=30)                    # 看门狗 1s 发现 + fn 立即收尾
+            self.assertFalse(p.is_alive(), "父进程死后 worker 没有退出（会变孤儿占显存）")
+            self.assertEqual(p.exitcode, 0)
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+            for x in (alive_r, alive_w):
+                try:
+                    x.close()
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

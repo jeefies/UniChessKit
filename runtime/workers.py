@@ -7,6 +7,12 @@ S 的 d87371c 教训：子进程静默退出（OOM、被 kill、C 扩展段错�
 - 进程已退出却没发过收尾消息 → 视为错误（报告退出码）；
 - 任何一个 worker 出错 → 置停止事件，其余 worker 尽快结束，run() 抛 WorkerError。
 
+2026-09-26 的新教训：**父进程被杀时 worker 不会自己退**。spawn 出来的 worker cmdline 是
+``python -c from multiprocessing.spawn import spawn_main ...``，``pkill -f 'Kit match'``
+匹配不到；父进程一死它们被过继给 init，还占着 GPU 显存和显存租约不放手。实测两个孤儿
+worker 就吃掉 2.5G，攒到 4 个把后来的训练直接 OOM。所以每个 worker 都带一个看门狗：
+父进程的管道写端一关（等价于父进程死亡）就置停止事件，宽限 10 秒后 ``os._exit(3)`` 强退。
+
 worker 函数签名：``fn(wid, task, emit, stop_event)``。``emit(obj)`` 把结果发回父进程
 （父进程按到达顺序回调 on_result），``stop_event.is_set()`` 为真时应尽快返回。
 fn 与 task 必须可 pickle（spawn 下 fn 必须是模块顶层函数）。
@@ -14,9 +20,14 @@ fn 与 task 必须可 pickle（spawn 下 fn 必须是模块顶层函数）。
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue as queue_mod
+import threading
 import traceback
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
+
+GRACE_S = 10.0        # 看门狗发现父进程死后给 fn 的收尾宽限
+POLL_S = 1.0          # 看门狗的轮询间隔
 
 
 class WorkerError(RuntimeError):
@@ -33,13 +44,59 @@ class _Emitter:
         self.q.put(("result", self.wid, obj))
 
 
-def _entry(fn, wid, task, q, stop_event):
+def _put(q, msg) -> None:
+    """父进程可能已经没了：发不出去就别赌（队列满/管道断都会抛）。"""
+    try:
+        q.put(msg, timeout=5)
+    except Exception:  # noqa: 父进程已死时收尾消息没有接收方，丢掉即可
+        pass
+
+
+def _parent_gone(alive_r, ppid: int) -> bool:
+    """父进程是否已死：优先看管道的 EOF，退化看 ppid 是否变了（Linux 上会被过继给 1）。"""
+    if alive_r is not None:
+        try:
+            if not alive_r.poll():
+                return False
+            try:
+                alive_r.recv()          # 父进程不会发数据；抛 EOFError 就是写端关了
+            except EOFError:
+                return True
+            except OSError:
+                return True
+            return False
+        except OSError:
+            return True
+    try:
+        return os.getppid() != ppid
+    except OSError:
+        return True
+
+
+def _watch_parent(alive_r, ppid: int, stop_event, guard: threading.Event) -> None:
+    """看门狗：父进程一没就置停止事件，宽限后强退。"""
+    while not guard.wait(POLL_S):
+        if not _parent_gone(alive_r, ppid):
+            continue
+        stop_event.set()                 # fn 里轮询 stop_event，会尽快收工
+        if not guard.wait(GRACE_S):      # 宽限：让 fn 把当前这一局收尾
+            os._exit(3)                  # 仍不退就强杀，别占着显存当孤儿
+        return
+
+
+def _entry(fn, wid, task, q, stop_event, alive_r=None):
+    ppid = os.getppid()
+    guard = threading.Event()
+    threading.Thread(target=_watch_parent,
+                     args=(alive_r, ppid, stop_event, guard), daemon=True).start()
     try:
         fn(wid, task, _Emitter(q, wid), stop_event)
     except BaseException:  # noqa: 一切异常（含 KeyboardInterrupt / SystemExit）都报给父进程
-        q.put(("error", wid, traceback.format_exc()))
+        _put(q, ("error", wid, traceback.format_exc()))
         return
-    q.put(("done", wid, None))
+    finally:
+        guard.set()                      # 正常结束：让看门狗退出
+    _put(q, ("done", wid, None))
 
 
 class WorkerPool:
@@ -49,11 +106,15 @@ class WorkerPool:
         self.poll_s = poll_s
 
     def run(self, fn: Callable, tasks: Sequence[Any],
-            on_result: Callable[[int, Any], None],
-            should_stop: Callable[[], bool] = lambda: False) -> None:
+             on_result: Callable[[int, Any], None],
+             should_stop: Callable[[], bool] = lambda: False) -> None:
         q = self.ctx.Queue()
         stop_event = self.ctx.Event()
-        procs = {wid: self.ctx.Process(target=_entry, args=(fn, wid, task, q, stop_event),
+        # 父进程活着凭据：写端由父进程持有且不写数据；父进程一死（含被 SIGKILL）
+        # 子进程的读端就收到 EOF，看门狗据此收工。不能提前关写端，否则会被误判。
+        alive_r, alive_w = self.ctx.Pipe(False)
+        procs = {wid: self.ctx.Process(target=_entry,
+                                       args=(fn, wid, task, q, stop_event, alive_r),
                                        daemon=True)
                  for wid, task in enumerate(tasks)}
         for p in procs.values():
@@ -87,6 +148,8 @@ class WorkerPool:
                 if p.is_alive():
                     p.terminate()
                     p.join(timeout=5)
+            alive_w.close()      # 放在 join 之后：提前关会让还活着的 worker 误判父进程已死
+            alive_r.close()
         if errors:
             raise WorkerError("\n".join(errors))
 
