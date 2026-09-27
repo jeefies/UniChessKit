@@ -1,6 +1,10 @@
 # 运行时产物（结果、日志、权重、数据分片一律不入库）
 /runs/
-/data/
+/data/*
+# polyglot 开局书（自对弈开局注入要用，是数据不是分片）
+!/data/*.bin
+# 开局库文本（bundled 的 curated 34 条 + 合成 2000 条）
+!/data/*.txt
 logs/
 *.jsonl
 *.pt
@@ -9,7 +13,6 @@ logs/
 *.safetensors
 *.zst
 *.bin
-!Kit/data/*.bin     # polyglot 开局书（自对弈开局注入要用，是数据不是分片）
 __pycache__/
 *.py[cod]
 *.egg-info/
