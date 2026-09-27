@@ -198,6 +198,57 @@ class TestMatch(Base):
         self.assertTrue(s["stopped_by_sprt"])
         self.assertLess(s["games"], 80)
 
+    def test_sprt_verdict_is_frozen_at_boundary(self):
+        """越界即结论：停止后又落盘的在途对局不得把 verdict 抹成 None。
+
+        2026-09-27 loop_p4_v2 gen 0 实测：``workers=2`` 时第 85 局（40 对）llr=+3.164
+        越过 H1 上界 2.890 触发停止，剩下几局在途对局补到 101 局后 llr 回落到 +1.471。
+        旧代码拿**最终记录集**重算 verdict，得到 None——一次本该换代的判定变成"没换代"。
+        workers=1 时没有在途对局，所以这个 bug 一直没暴露。
+
+        序列（每对给 a 方总分）：8 对 A 全胜 -> 86 对一胜一负。前者把 llr 推过 H1
+        上界触发停止，后者把最终 llr 拉回 -0.082（界内），即"该停且该判 H1，
+        但重算已无判决"。
+        """
+        from Kit.pipelines.match import _Run, _sprt_decided
+        cfg = MatchConfig(pairs=400, max_plies=80, sprt=SprtConfig(elo0=0, elo1=60,
+                                                                  min_pairs=8))
+        pairs = [2.0] * 8 + [1.0] * 86
+        run = _Run(cfg, {"A": "a", "B": "b"}, None, None)
+        i = 0
+        for p, total in enumerate(pairs):
+            for g, sc in enumerate((total / 2.0, total / 2.0)):
+                run.add({"game": i, "pair": p, "a_score": sc,
+                         "termination": "checkmate", "plies": 40,
+                         "white": "A" if g == 0 else "B", "opening": [f"o{i}"],
+                         "moves": [f"m{i}"], "sources": {"A": {"search": 1, "tablebase": 0},
+                                                         "B": {"search": 1, "tablebase": 0}}})
+                i += 1
+        # 停止已触发，且判决冻结为 H1
+        self.assertTrue(run.stopped)
+        self.assertEqual(run.stopped_verdict, "H1")
+        # 而拿最终记录集重算已经退回界内（这正是旧代码出错的地方）
+        decided, verdict = _sprt_decided(run.records, cfg)
+        self.assertFalse(decided)
+        self.assertIsNone(verdict)
+        llr = summarize(run.records, cfg, {})["sprt"]["llr"]
+        self.assertTrue(-2.251 < llr < 2.890, f"最终 llr={llr} 应落在界内")
+
+    def test_sprt_stopped_always_has_a_verdict(self):
+        """不变式：只要停了，就必须带着一个非 None 的判决（否则 promotion 无从判断）。"""
+        from Kit.pipelines.match import _Run, _sprt_decided
+        cfg = MatchConfig(pairs=60, max_plies=80, sprt=SprtConfig(elo0=0, elo1=60,
+                                                                 min_pairs=4))
+        run = _Run(cfg, {"A": "a", "B": "b"}, None, None)
+        for i in range(30):
+            run.add({"game": i, "pair": i // 2, "a_score": 1.0,
+                     "termination": "checkmate", "plies": 40,
+                     "white": "A" if i % 2 == 0 else "B", "opening": [f"o{i}"],
+                     "moves": [f"m{i}"], "sources": {"A": {"search": 1, "tablebase": 0},
+                                                     "B": {"search": 1, "tablebase": 0}}})
+        self.assertTrue(run.stopped)
+        self.assertIn(run.stopped_verdict, ("H0", "H1"))
+
     def test_argument_validation(self):
         with self.assertRaises(ValueError):
             run_match(MatchConfig(pairs=1), make_a=RandomPlayer)

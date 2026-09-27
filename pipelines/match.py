@@ -262,10 +262,19 @@ def summarize(records: list, cfg: MatchConfig, names: dict) -> dict:
     return out
 
 
-def _sprt_decided(records: list, cfg: MatchConfig) -> bool:
+def _sprt_decided(records: list, cfg: MatchConfig) -> tuple:
+    """``(是否该停, 当时的判决)``。
+
+    判决必须按**触发停止的那份记录**算：SPRT 是序贯检验，越界即结论，之后再补进来的
+    在途对局不该把结论推翻。``workers > 1`` 时停止信号发出后还会有几局在途对局落盘，
+    若拿最终记录集重算，llr 很可能退回界内——2026-09-27 实测 loop_p4_v2 gen 0：
+    第 85 局 llr=+3.164（越过 H1 上界 2.890）触发停止，补到 101 局后 llr 回落到
+    +1.471，``verdict`` 变 ``None``，一次本该成功的换代被判成"没换代"。
+    """
     if cfg.sprt is None:
-        return False
-    return summarize(records, cfg, {}).get("sprt", {}).get("verdict") is not None
+        return False, None
+    verdict = summarize(records, cfg, {}).get("sprt", {}).get("verdict")
+    return verdict is not None, verdict
 
 
 # ------------------------------------------------------------------ 结果文件
@@ -359,13 +368,17 @@ class _Run:
         self.external_stop = should_stop
         self.records: list = []
         self.stopped = False
+        self.stopped_verdict: Optional[str] = None      # 越界那一刻的判决（冻结）
 
     def add(self, record: dict) -> None:
         if self.log is not None:
             self.log.append(record)
         self.records.append(record)
-        if not self.stopped and _sprt_decided(self.records, self.cfg):
-            self.stopped = True
+        if not self.stopped:
+            decided, verdict = _sprt_decided(self.records, self.cfg)
+            if decided:
+                self.stopped = True
+                self.stopped_verdict = verdict
         if self.progress is not None:
             self.progress(record, self.records)
 
@@ -443,7 +456,7 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
             if done:
                 print(f"[match] 续跑：已完成 {len(done)} 局", file=sys.stderr)
             tasks = [t for t in tasks if t.game not in done]
-            run.stopped = _sprt_decided(run.records, cfg)
+            run.stopped, run.stopped_verdict = _sprt_decided(run.records, cfg)
         if tasks and not run.should_stop():
             if cfg.workers == 1:
                 if make_a is None:
@@ -455,6 +468,9 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
         if log is not None:
             log.close()
     summary = summarize(run.records, cfg, names)
+    if run.stopped_verdict is not None:
+        # 用越界那一刻的判决覆盖"拿最终记录集重算"的结果（见 _sprt_decided 的说明）
+        summary.setdefault("sprt", {})["verdict"] = run.stopped_verdict
     summary.update(config_hash=header["config_hash"], games_planned=2 * cfg.pairs,
                    stopped_by_sprt=run.stopped and len(run.records) < 2 * cfg.pairs,
                    batch=batch_stats, elapsed_s=round(time.perf_counter() - t0, 1),
