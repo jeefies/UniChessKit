@@ -147,6 +147,18 @@ class Loop:
     def gen_dir(self, g: int) -> Path:
         return self.out / f"gen_{g:04d}"
 
+    def candidate_path(self, g: int, variant: Optional[str]) -> str:
+        """本代候选权重的落地路径。
+
+        search 代的胜者在 ``train_<label>/`` 下（``phase_search`` 一行挑出来）；
+        非 search 代（``enumerate_generations`` 用尽后）以及还没选变体时在 ``train/``
+        下（``phase_train`` 的产物）。两者不可混用——续跑时 ``mapping`` 只会给后者。
+        """
+        export = self.conf.get("export", "final.pt")
+        if variant and self.uses_search(g):
+            return str(self.gen_dir(g) / f"train_{variant}" / export)
+        return str(self.gen_dir(g) / "train" / export)
+
     def mapping(self, g: int, champion: str) -> dict:
         window = int(self.conf.get("window", 1))
         files = []
@@ -156,7 +168,7 @@ class Loop:
         gd = self.gen_dir(g)
         return {"{weights}": champion, "{gen}": g, "{gen_dir}": str(gd),
                 "{selfplay_dir}": str(gd / "selfplay"), "{selfplay_files}": files,
-                "{candidate}": str(gd / "train" / self.conf.get("export", "final.pt"))}
+                "{candidate}": self.candidate_path(g, None)}
 
     # ------------------------------------------------------------ 枚举搜索
     def uses_search(self, g: int) -> bool:
@@ -366,6 +378,12 @@ class Loop:
                 g = st["generation"]
                 self.gen_dir(g).mkdir(parents=True, exist_ok=True)
                 m = self.mapping(g, st["champion"])
+                # 续跑纠正候选路径：中断后 phase 停在 arena 时，mapping 只会给
+                # phase_train 用的 train/ 路径，而 search 代的胜者在 train_<label>/ 下。
+                # （2026-09-27 实测：在 arena 阶段重启 loop → FileNotFoundError:
+                #   .../gen_0000/train/final.pt）
+                if st["phase"] == "arena":
+                    m = {**m, "{candidate}": self.candidate_path(g, st.get("variant"))}
                 t0 = time.time()
                 if st["phase"] == "selfplay":
                     self.phase_selfplay(g, m)
@@ -374,9 +392,7 @@ class Loop:
                     m = self.mapping(g, st["champion"])      # 本代分片现在才存在
                 if st["phase"] == "search":
                     label = self._search_all(g, m)
-                    picked = self.gen_dir(g) / f"train_{label}" / self.conf.get("export",
-                                                                               "final.pt")
-                    m = {**m, "{candidate}": str(picked)}
+                    m = {**m, "{candidate}": self.candidate_path(g, label)}
                     st["variant"] = label
                     st["train_variant"] = self._selected_variant_config(g)
                     st["phase"] = "arena"

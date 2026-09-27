@@ -17,6 +17,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from Kit.pipelines.loop import Loop, _subst
 
@@ -111,6 +112,68 @@ class TestLoopMapping(unittest.TestCase):
 
     def test_mapping_survives_missing_dirs(self):
         self.assertEqual(self.loop.mapping(7, "/w")["{selfplay_files}"], [])
+
+
+class _Stop(Exception):
+    """用来中断 ``run()`` 的哨兵。"""
+
+
+class TestArenaResumeCandidate(unittest.TestCase):
+    """中断后从 arena 阶段续跑：候选权重必须跟着 search 代的胜者走。
+
+    2026-09-27 实测踩到：在 arena 阶段重启 loop，``mapping`` 给的 ``{candidate}`` 是
+    ``gen_XXXX/train/final.pt``（``phase_train`` 的产物路径），而 search 代的胜者在
+    ``gen_XXXX/train_<label>/`` 下，于是 ``FileNotFoundError``。只有正常往下走的
+    search 分支会覆盖 ``{candidate}``，续跑路径没人覆盖。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
+
+    def test_candidate_path_follows_search_winner(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        self.assertEqual(loop.candidate_path(0, "lr2e-5_s1200"),
+                         str(loop.gen_dir(0) / "train_lr2e-5_s1200" / "final.pt"))
+
+    def test_candidate_path_without_variant_is_train_dir(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        self.assertEqual(loop.candidate_path(0, None),
+                         str(loop.gen_dir(0) / "train" / "final.pt"))
+        m = loop.mapping(0, "/w/c.pt")
+        self.assertEqual(m["{candidate}"], str(loop.gen_dir(0) / "train" / "final.pt"))
+
+    def test_candidate_path_after_enumerate_exhausted(self):
+        """``enumerate_generations`` 用尽的代不再 search，胜者路径让位给 ``train/``。"""
+        loop = Loop(_variant_conf(self.tmp, enumerate_generations=1), self.tmp)
+        self.assertFalse(loop.uses_search(1))
+        self.assertEqual(loop.candidate_path(1, "lr2e-5_s1200"),
+                         str(loop.gen_dir(1) / "train" / "final.pt"))
+
+    def test_resume_in_arena_uses_search_winner(self):
+        loop = Loop(_variant_conf(self.tmp), self.tmp)
+        gd = loop.gen_dir(0)
+        gd.mkdir(parents=True, exist_ok=True)
+        (gd / "train_lr2e-5_s1200").mkdir()
+        (gd / "train_lr2e-5_s1200" / "final.pt").write_bytes(b"\0")
+        (gd / "search.json").write_text(json.dumps({
+            "lr2e-5_s1200": {"label": "lr2e-5_s1200", "config": {"steps": 1200},
+                             "score_a": 0.673, "elo": 125.5, "games": 385},
+            "_selected": "lr2e-5_s1200"}), encoding="utf-8")
+        loop.state_path.write_text(json.dumps({
+            "generation": 0, "phase": "arena", "champion": "/w/c.pt",
+            "history": [], "variant": "lr2e-5_s1200"}), encoding="utf-8")
+        seen = {}
+
+        def fake_arena(self, g, m):
+            seen["g"], seen["cand"] = g, m["{candidate}"]
+            raise _Stop
+
+        with mock.patch.object(Loop, "phase_arena", fake_arena):
+            with self.assertRaises(_Stop):
+                loop.run()
+        self.assertEqual(seen["g"], 0)
+        self.assertEqual(seen["cand"], str(gd / "train_lr2e-5_s1200" / "final.pt"))
+        self.assertTrue((gd / "train_lr2e-5_s1200" / "final.pt").exists())
 
 
 class TestPromote(unittest.TestCase):
