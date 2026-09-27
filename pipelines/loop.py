@@ -172,13 +172,23 @@ class Loop:
         return g < self.enumerate_generations
 
     def _variant_train_conf(self, variant: dict, m: dict) -> dict:
-        """base train 模板与 variant 递归合并后做占位符替换；``out`` 按 label 分开。"""
-        base = copy.deepcopy(self.conf["train"])
-        base.pop("variants", None)
-        base.pop("screen", None)
-        conf = _merge(base, variant)
-        conf.pop("label", None)
-        conf["out"] = str(Path(m["{gen_dir}"]) / f"train_{variant['label']}")
+        """base train 模板与 variant 递归合并后做占位符替换；``out`` 按 label 分开。
+
+        ``schedule`` 是**整体替换**而不是合并：它是自含的小字典，合并会留下对方的键
+        （例如基座 ``{"kind":"onecycle","pct_start":0.25}`` 加上变体的
+        ``{"kind":"constant"}`` 就成了 ``{kind: constant, pct_start: 0.25}``，
+        ``build_schedule`` 会以「未知参数」为由报错）。
+        """
+        base = self._base_train()
+        over = copy.deepcopy(variant)
+        label = over.pop("label")
+        base_sched, over_sched = base.pop("schedule", None), over.pop("schedule", None)
+        conf = _merge(base, over)
+        if over_sched is not None:
+            conf["schedule"] = copy.deepcopy(over_sched)
+        elif base_sched is not None:
+            conf["schedule"] = copy.deepcopy(base_sched)
+        conf["out"] = str(Path(m["{gen_dir}"]) / f"train_{label}")
         return _subst(conf, m)
 
     def _screen_conf(self, m: dict, label: str) -> dict:

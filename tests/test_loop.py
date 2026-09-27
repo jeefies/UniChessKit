@@ -205,6 +205,22 @@ class TestVariantSearchConfig(unittest.TestCase):
         self.assertNotIn("screen", got)
         self.assertEqual(loop.conf["train"], base)                # 原配置未被改动
 
+    def test_schedule_is_replaced_not_merged(self):
+        """variant 的 schedule 整体替换：合并会把 onecycle 的 pct_start 带给 constant，
+        ``build_schedule`` 会以「未知参数」报错（2026-09-27 写配方时踩到）。"""
+        conf = _variant_conf(self.tmp)
+        conf["train"]["schedule"] = {"kind": "onecycle", "pct_start": 0.25}
+        conf["train"]["variants"] = [
+            {"label": "const", "schedule": {"kind": "constant"}, "steps": 10},
+            {"label": "1c", "steps": 10},                          # 不覆盖 → 继承基座
+        ]
+        loop = Loop(conf, self.tmp)
+        m = loop.mapping(0, "/w/champ.pt")
+        got_const = loop._variant_train_conf(loop.variants[0], m)
+        got_inherit = loop._variant_train_conf(loop.variants[1], m)
+        self.assertEqual(got_const["schedule"], {"kind": "constant"})
+        self.assertEqual(got_inherit["schedule"], {"kind": "onecycle", "pct_start": 0.25})
+
     def test_variant_placeholders_substituted(self):
         loop = Loop(_variant_conf(self.tmp), self.tmp)
         m = loop.mapping(2, "/w/champ.pt")
