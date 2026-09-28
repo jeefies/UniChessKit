@@ -9,9 +9,11 @@
 - **裁决统一**：rules.StandardReferee（claim_draw 语义，走满 max_plies 记截断 = 和）。
 - **出错整批停止**：任何 Player 抛异常或走非法着法 → 整批中止并原样报错，不产出半截统计。
 - **SPRT 早停**：以五项式（逐对）GSPRT 判定；只在完整的对上计算；达到判定后不再开新局，
-  已开局的照常下完并入库。
+  已开局的照常下完并入库。判决在**越界那一刻**冻结（序贯检验的语义），之后补写的在途
+  对局、以及从结果文件续跑时的重放，都不许把它推翻。
 - **断点续跑**：结果逐局追加写入 JSONL（每行 flush + fsync），首行是含配置哈希的表头；
-  重跑同一命令时核对哈希、跳过已完成的局。文件末尾被截断的半行会被丢弃。
+  重跑同一命令时核对哈希、跳过已完成的局。文件末尾被截断的半行会被丢弃；只剩表头的
+  残留文件（上次建引擎前崩了）换配置时重写表头，不堵死重试。
 - **有效样本量**：distinct_games / duplicate_rate（S 教训：确定性对局下重复开局 = 逐字节重复棋谱）。
 
 可复现性：单进程（workers=1）、不用 deadline 时，同一配置两次运行的着法与结果逐局一致。
@@ -277,6 +279,26 @@ def _sprt_decided(records: list, cfg: MatchConfig) -> tuple:
     return verdict is not None, verdict
 
 
+def _sprt_stop_point(records: list, cfg: MatchConfig) -> tuple:
+    """``(越界记录的下标, 越界那一刻的判决)``；没有越界则 ``(None, None)``。
+
+    续跑专用：结果文件里的记录顺序就是当初的到达顺序，逐前缀重放能**复现**"越界即停"
+    那一刻的结论。只看读回的全部记录是不够的——进程若在"越界已落盘、汇总还没写"的
+    窗口里被杀，恢复时那份记录集的 llr 往往已被在途对局拖回界内，重算会认为"还没停"，
+    于是把剩下的对重新下一遍，判决也跟着变（H1 变 None 甚至 H0）。
+    ``add()`` 与这里必须给出同一个答案：越界点 = 第一个让判决非 None 的前缀。
+    """
+    if cfg.sprt is None:
+        return None, None
+    # 判决要求至少 min_pairs 个完整对（summarize 的门槛），更短的前缀不可能越界，
+    # 从 2*min_pairs-1 起跳只是省掉必然无结论的前缀，不改变找到的越界点。
+    for i in range(max(0, 2 * cfg.sprt.min_pairs - 1), len(records)):
+        _, verdict = _sprt_decided(records[: i + 1], cfg)
+        if verdict is not None:
+            return i, verdict
+    return None, None
+
+
 # ------------------------------------------------------------------ 结果文件
 
 def config_hash(cfg: MatchConfig, players: dict) -> str:
@@ -295,17 +317,29 @@ class ResultLog:
         self._fh = None
 
     def open(self) -> list:
-        """打开（或续接）文件，返回已完成的记录。"""
+        """打开（或续接）文件，返回已完成的记录。
+
+        文件已存在却**没有任何对局记录**时（典型：上次在创建 Player 前就崩了，只留下
+        表头——``run_match`` 是先写表头再建引擎的），即使配置哈希不符也重写表头：
+        没有结果会被污染，否则残留的空表头会以"配置哈希不符"堵死后续所有重试
+        （2026-09-27 loop_p4_v2 gen 0 实测：改对 checkpoint 后重试直接被拒，只能手工删）。
+        其余情况与既有纪律一致：哈希不符 / 中间行损坏 / 缺表头一律抛错。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        games: list = []
+        reuse = False
         if self.path.exists() and self.path.stat().st_size > 0:
-            self.records = self._load_existing()
+            games, reuse = self._load_existing()
+        if reuse:
+            self.records = games
             self._fh = open(self.path, "a", encoding="utf-8", newline="\n")
         else:
+            self.records = []
             self._fh = open(self.path, "w", encoding="utf-8", newline="\n")
             self._write(self.header)
         return list(self.records)
 
-    def _load_existing(self) -> list:
+    def _load_existing(self) -> tuple:
         raw = self.path.read_bytes()
         # 每条记录以换行结尾；没有换行结尾的最后一段是写入中途被杀留下的半行
         cut = raw.rfind(b"\n") + 1
@@ -329,16 +363,21 @@ class ResultLog:
         if not parsed or parsed[0].get("type") != "header":
             raise ValueError(f"{self.path} 缺少表头，不是本工具写的结果文件")
         old = parsed[0]
+        games = [r for r in parsed[1:] if r.get("type") == "game"]
+        if not games and old.get("config_hash") != self.header["config_hash"]:
+            # 一局都没写：换配置重开不污染任何结果（见 open 的说明）
+            print(f"[match] {self.path} 只有表头、没有对局记录，按本次配置重写",
+                  file=sys.stderr)
+            return [], False
         if old.get("config_hash") != self.header["config_hash"]:
             raise ValueError(f"{self.path} 的配置哈希 {old.get('config_hash')} 与本次 "
                              f"{self.header['config_hash']} 不一致；换一个输出路径或删除旧文件")
-        games = [r for r in parsed[1:] if r.get("type") == "game"]
         seen = set()
         for r in games:
             if r["game"] in seen:
                 raise ValueError(f"{self.path} 中第 {r['game']} 局重复出现")
             seen.add(r["game"])
-        return games
+        return games, True
 
     def _write(self, obj: dict) -> None:
         self._fh.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
@@ -369,6 +408,7 @@ class _Run:
         self.records: list = []
         self.stopped = False
         self.stopped_verdict: Optional[str] = None      # 越界那一刻的判决（冻结）
+        self.stopped_at_game: Optional[int] = None      # 触发越界的那一局（冻结的锚点）
 
     def add(self, record: dict) -> None:
         if self.log is not None:
@@ -379,6 +419,7 @@ class _Run:
             if decided:
                 self.stopped = True
                 self.stopped_verdict = verdict
+                self.stopped_at_game = record["game"]
         if self.progress is not None:
             self.progress(record, self.records)
 
@@ -456,7 +497,13 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
             if done:
                 print(f"[match] 续跑：已完成 {len(done)} 局", file=sys.stderr)
             tasks = [t for t in tasks if t.game not in done]
-            run.stopped, run.stopped_verdict = _sprt_decided(run.records, cfg)
+            # 续跑同样冻结，且必须与 add() 的当场判定一致：按文件顺序逐前缀重放，
+            # 在第一个越界点定格。不能只对读回的全部记录算一遍——见 _sprt_stop_point。
+            idx, verdict = _sprt_stop_point(run.records, cfg)
+            if verdict is not None:
+                run.stopped = True
+                run.stopped_verdict = verdict
+                run.stopped_at_game = run.records[idx]["game"]
         if tasks and not run.should_stop():
             if cfg.workers == 1:
                 if make_a is None:
@@ -469,8 +516,12 @@ def run_match(cfg: MatchConfig, *, spec_a: Optional[EngineSpec] = None,
             log.close()
     summary = summarize(run.records, cfg, names)
     if run.stopped_verdict is not None:
-        # 用越界那一刻的判决覆盖"拿最终记录集重算"的结果（见 _sprt_decided 的说明）
-        summary.setdefault("sprt", {})["verdict"] = run.stopped_verdict
+        # 用越界那一刻的判决覆盖"拿最终记录集重算"的结果（见 _sprt_decided 的说明）。
+        # llr / 局数等仍是**最终记录集**的统计值，stopped_at_game 是两者的对账锚点。
+        sprt = summary.setdefault("sprt", {})
+        sprt["verdict"] = run.stopped_verdict
+        if run.stopped_at_game is not None:
+            sprt["stopped_at_game"] = run.stopped_at_game
     summary.update(config_hash=header["config_hash"], games_planned=2 * cfg.pairs,
                    stopped_by_sprt=run.stopped and len(run.records) < 2 * cfg.pairs,
                    batch=batch_stats, elapsed_s=round(time.perf_counter() - t0, 1),

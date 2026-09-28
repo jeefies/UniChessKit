@@ -27,6 +27,38 @@ def read_games(path):
     return lines[0], sorted((r for r in lines[1:] if r["type"] == "game"), key=lambda r: r["game"])
 
 
+def fake_record(game, pair, a_score, white):
+    """一条合成对局记录（续跑 / 判决测试用，不需要真下棋）。"""
+    return {"type": "game", "game": game, "pair": pair, "a_score": a_score, "white": white,
+            "termination": "checkmate", "plies": 40, "opening": [f"o{game}"],
+            "moves": [f"m{game}"], "sources": {"A": {"search": 1, "tablebase": 0},
+                                               "B": {"search": 1, "tablebase": 0}}}
+
+
+def records_from_pair_scores(pair_scores):
+    """每对给 A 的总分（∈ {0, 0.5, 1, 1.5, 2}）→ 两局一组的记录列表。"""
+    out = []
+    for p, total in enumerate(pair_scores):
+        for g, sc in enumerate((total / 2.0, total / 2.0)):
+            out.append(fake_record(2 * p + g, p, sc, "A" if g == 0 else "B"))
+    return out
+
+
+def write_result_file(path, cfg, records):
+    """按 run_match 的表头格式写一份结果文件（续跑测试用；复用 make 路径的哈希口径）。"""
+    from Kit.pipelines.match import RESULT_SCHEMA, ResultLog, config_hash
+    players_id = {"A": "a", "B": "b"}
+    header = {"type": "header", "schema": RESULT_SCHEMA,
+              "config_hash": config_hash(cfg, players_id), "match": cfg.to_dict(),
+              "players": players_id, "names": players_id,
+              "opening_library": 0, "provenance": {}}
+    log = ResultLog(path, header)
+    log.open()
+    for r in records:
+        log.append(r)
+    log.close()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
@@ -238,7 +270,7 @@ class TestMatch(Base):
         """不变式：只要停了，就必须带着一个非 None 的判决（否则 promotion 无从判断）。"""
         from Kit.pipelines.match import _Run, _sprt_decided
         cfg = MatchConfig(pairs=60, max_plies=80, sprt=SprtConfig(elo0=0, elo1=60,
-                                                                 min_pairs=4))
+                                                                  min_pairs=4))
         run = _Run(cfg, {"A": "a", "B": "b"}, None, None)
         for i in range(30):
             run.add({"game": i, "pair": i // 2, "a_score": 1.0,
@@ -248,6 +280,76 @@ class TestMatch(Base):
                                                      "B": {"search": 1, "tablebase": 0}}})
         self.assertTrue(run.stopped)
         self.assertIn(run.stopped_verdict, ("H0", "H1"))
+
+    def test_resume_freezes_verdict_at_crossing(self):
+        """续跑必须冻结"越界那一刻"的判决；H1 / H0 两个方向都不许被在途对局推翻。
+
+        6f91bd6 修的是**同一进程内**的冻结（``_Run.add`` 判停、``run_match`` 的 summary
+        拿最终记录集重算），但续跑路径只是对**读回的全部记录**重算一遍。若进程在
+        "越界已落盘、汇总还没写"的窗口里被杀（``workers=2`` 时停止后还有在途对局在补），
+        恢复时那份记录集的 llr 往往已被拖回界内：续跑认为"还没停"，把剩下的对重新下一
+        遍，最终判决变 None 甚至反向——本该 H1 的换代又被记成"没换代"。
+
+        序列（每对给 A 的总分）：H1 方向 8 对全胜 + 70 对一胜一负（越界于第 8 对，
+        最终 llr=+2.47 退回界内）；H0 方向 8 对全负 + 20 对 1½ 分（越界判 H0，
+        最终 llr=-0.15 退回界内）。两个文件都故意少 5 对没下：冻结生效时一局都不该再开。
+        """
+        from Kit.pipelines.match import _Run
+
+        def case(name, pair_scores, expect):
+            cfg = MatchConfig(pairs=len(pair_scores) + 5, max_plies=80,
+                              sprt=SprtConfig(elo0=0, elo1=60, min_pairs=8))
+            records = records_from_pair_scores(pair_scores)
+            out = self.dir / f"{name}.jsonl"
+            write_result_file(out, cfg, records)
+            # 续跑：当场冻结，一局新棋都不开
+            s = run_match(cfg, make_a=make_fake_player_factory("a"),
+                          make_b=make_random_player_factory(), out_path=out,
+                          names={"A": "a", "B": "b"})
+            self.assertEqual(s["games"], len(records))
+            self.assertEqual(s["sprt"]["verdict"], expect)
+            self.assertEqual(s["sprt"]["stopped_at_game"], 15)
+            self.assertTrue(s["stopped_by_sprt"])
+            # 与"当初一路跑下来"的当场冻结一致（同一条不变式的两种走法）
+            run = _Run(cfg, {"A": "a", "B": "b"}, None, None)
+            for r in records:
+                run.add(r)
+            self.assertEqual(run.stopped_verdict, expect)
+            self.assertEqual(run.stopped_at_game, 15)
+            # 拿最终记录集重算确实已无判决——旧代码正是因此丢掉结论
+            self.assertIsNone(summarize(records, cfg, {})["sprt"]["verdict"])
+
+        case("h1", [2.0] * 8 + [1.0] * 70, "H1")
+        case("h0", [0.0] * 8 + [1.5] * 20, "H0")
+
+    def test_header_only_file_is_reinitialized_on_hash_change(self):
+        """只剩表头的残留文件不许堵死重试：换配置时重写表头，而不是报"配置哈希不符"。
+
+        ``run_match`` 先写表头、再建 Player。若建 Player 时崩了（例如 checkpoint 路径
+        写错），文件里只有表头。2026-09-27 loop_p4_v2 gen 0 实测：改对路径重试，残留
+        header 的哈希对不上新配置，续跑直接 ``ValueError``，只能手工删/改名
+        （``arena.jsonl.bad_checkpoint_20260927``），排查成本全在"为什么它不自己重跑"上。
+        表头里没有任何对局，重写它不会污染结果。
+        """
+        out = self.dir / "r.jsonl"
+
+        def boom():
+            raise RuntimeError("引擎加载失败（模拟 checkpoint 路径写错）")
+
+        with self.assertRaisesRegex(RuntimeError, "引擎加载失败"):
+            run_match(MatchConfig(pairs=1, max_plies=20), make_a=boom,
+                      make_b=make_random_player_factory(), out_path=out,
+                      names={"A": "a", "B": "b"})
+        self.assertEqual(out.read_text(encoding="utf-8").count("\n"), 1)   # 只剩表头
+        # 换一份配置（哈希不同）重试：必须接着跑完，而不是 ValueError
+        s = run_match(MatchConfig(pairs=1, max_plies=20, seed=99),
+                      make_a=make_fake_player_factory("a"),
+                      make_b=make_random_player_factory(), out_path=out,
+                      names={"A": "a", "B": "b"})
+        self.assertEqual(s["games"], 2)
+        header, games = read_games(out)
+        self.assertEqual(header["config_hash"], s["config_hash"])          # 表头已重写
+        self.assertEqual(len(games), 2)
 
     def test_argument_validation(self):
         with self.assertRaises(ValueError):
