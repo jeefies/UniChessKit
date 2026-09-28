@@ -8,10 +8,15 @@
 - `export.final` / `export.best`（无 validate 时）按配置写出；
 - accum>1 时 backward 的是 `loss/accum`（R iteration46 / T t20m 的口径），
   而日志里记录的是未除的 total（旧脚本 `.item()` 的记录口径）。
+
+学习率调度（``Kit.train.schedule``）的构建与参数体检由 ``TestSchedule`` 钉死，
+特别是两个手写调度的 ``warmup`` / 余弦窗口 **缺参数或 ≤ 0 时要有清楚报错**
+（loop 的变体会整体替换 ``schedule``，替换后少了 ``warmup`` 是真实场景）。
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -26,6 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from Kit.train import TrainConfig, Trainer
+from Kit.train.schedule import build_schedule
 
 KIT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -221,6 +227,84 @@ class TestTrainerLoop(unittest.TestCase):
         by_step = [seen[i * 4:(i + 1) * 4] for i in range(3)]
         for r, chunk in zip(recs, by_step):
             self.assertAlmostEqual(sum(chunk), r["loss"], places=4)
+
+
+class TestSchedule(unittest.TestCase):
+    """``build_schedule``：kind 分派、参数体检、手写调度的 warmup 语义。
+
+    2026-09-27 loop 的实况：``train.variants`` 里一个变体写
+    ``{"kind": "warmup_cosine_floor", "floor": 0.1, "scale": 0.9}``（同 kind 的其他参数
+    想沿用基座），而 schedule 是**整体替换**，基座的 ``warmup: 2000`` 整个丢掉 →
+    ``_resolve_warmup`` 退到 0 → ``(step + 1) / warmup`` 除零，训练循环里才炸。
+    缺参数 / 余弦窗口 0 / 负 warmup 都必须在**构建时**就报清楚。
+    """
+
+    def _opt(self, lr=1e-3):
+        p = torch.nn.Parameter(torch.zeros(1))
+        return torch.optim.AdamW([p], lr=lr)
+
+    def test_unknown_kind_and_constant(self):
+        sched, manual = build_schedule({"kind": "constant"}, self._opt(), 10, 1e-3)
+        self.assertIsNone(sched)                      # constant 不需要调度器
+        self.assertIsNone(manual)
+        with self.assertRaises(ValueError):
+            build_schedule({"kind": "nope"}, self._opt(), 10, 1e-3)
+
+    def test_onecycle_uses_total_steps_default(self):
+        opt = self._opt()
+        sched, manual = build_schedule({"kind": "onecycle", "pct_start": 0.25}, opt, 100, 1e-3)
+        self.assertIsNotNone(sched)
+        self.assertIsNone(manual)
+        self.assertEqual(sched.total_steps, 100)      # 缺省 total_steps = 训练步数
+        sched.step()
+        self.assertGreater(opt.param_groups[0]["lr"], 0.0)
+
+    def test_warmup_cosine_floor_without_warmup_is_full_lr(self):
+        """``warmup`` 缺省 / 为 0 = 没有 warmup，第 0 步就是全 lr（不再除零）。"""
+        sched, manual = build_schedule({"kind": "warmup_cosine_floor", "floor": 0.1,
+                                        "scale": 0.9}, self._opt(), 100, 1e-3)
+        self.assertIsNone(sched)
+        self.assertEqual(manual.warmup, 0)
+        self.assertAlmostEqual(manual.lr_at(0), 1e-3)      # 0.1 + 0.9·0.5·(1+cos 0) = 1.0
+        self.assertAlmostEqual(manual.lr_at(100), 1e-4)    # 末端：0.1 + 0 = 0.1
+
+    def test_warmup_cosine_floor_warmup_factor(self):
+        """有 warmup 时前 warmup 步按 (s+1)/warmup 线性放大（旧 R iteration46 口径）。"""
+        _, manual = build_schedule({"kind": "warmup_cosine_floor", "warmup": 4, "floor": 0.0,
+                                    "scale": 1.0}, self._opt(), 100, 1e-3)
+        self.assertEqual(manual.warmup, 4)
+        # 前 warmup 步只有全 lr 的 (s+1)/warmup，余弦部分照算
+        self.assertAlmostEqual(manual.lr_at(0),
+                               1e-3 * 0.25 * 0.5 * (1 + math.cos(0.0)))
+        self.assertAlmostEqual(manual.lr_at(3),
+                               1e-3 * 1.0 * 0.5 * (1 + math.cos(math.pi * 3 / 100)))
+        # 到点之后不再被放大/压住：倍率恒为 1
+        self.assertAlmostEqual(manual.lr_at(4),
+                               1e-3 * 1.0 * 0.5 * (1 + math.cos(math.pi * 4 / 100)))
+
+    def test_warmup_then_cosine_without_warmup(self):
+        sched, manual = build_schedule({"kind": "warmup_then_cosine", "floor": 0.1,
+                                        "scale": 0.9}, self._opt(), 100, 1e-3)
+        self.assertIsNone(sched)
+        self.assertEqual(manual.warmup, 0)
+        self.assertAlmostEqual(manual.lr_at(0), 1e-3)
+        self.assertAlmostEqual(manual.lr_at(100), 1e-4)
+
+    def test_manual_schedule_rejects_bad_params(self):
+        for spec in ({"kind": "warmup_cosine_floor", "scale": 0.9},            # 缺 floor
+                     {"kind": "warmup_cosine_floor", "floor": 0.1},            # 缺 scale
+                     {"kind": "warmup_then_cosine", "floor": 0.1, "scale": 0.9,
+                      "steps": 0},                                              # 余弦窗口 0
+                     {"kind": "warmup_cosine_floor", "floor": 0.1, "scale": 0.9,
+                      "warmup": -1}):                                           # 负 warmup
+            with self.assertRaises(ValueError, msg=f"{spec} 该报错"):
+                build_schedule(spec, self._opt(), 100, 1e-3)
+
+    def test_object_schedules_reject_empty_window(self):
+        with self.assertRaises(ValueError):
+            build_schedule({"kind": "cosine", "t_max": 0}, self._opt(), 100, 1e-3)
+        with self.assertRaises(ValueError):
+            build_schedule({"kind": "onecycle", "total_steps": 0}, self._opt(), 100, 1e-3)
 
 
 if __name__ == "__main__":

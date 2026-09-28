@@ -28,13 +28,20 @@ KINDS = ("constant", "cosine", "onecycle", "lambda", "warmup_cosine_floor",
 
 
 class ManualSchedule:
-    """每步前调用 ``apply(opt, step)``；无内部状态（续训不需要保存）。"""
+    """每步前调用 ``apply(opt, step)``；无内部状态（续训不需要保存）。
+
+    ``warmup <= 0`` 表示**没有 warmup**（从第 0 步就是全 lr）。0 是 ``_resolve_warmup``
+    的缺省值，这里不能再拿它做除数——2026-09-27 的实况是：基座带 ``warmup: 2000`` 的
+    ``warmup_cosine_floor`` 被变体整体替换成不带 ``warmup`` 的同 kind 小字典，
+    ``(step + 1) / warmup`` 当场 ZeroDivisionError（模型已建、数据流已开）。
+    """
 
     def __init__(self, lr: float, warmup: int, floor: float, scale: float, steps: int):
         self.lr, self.warmup, self.floor, self.scale, self.steps = lr, warmup, floor, scale, steps
 
     def lr_at(self, step: int) -> float:
-        return self.lr * min(1, (step + 1) / self.warmup) * (
+        warm = min(1, (step + 1) / self.warmup) if self.warmup > 0 else 1.0
+        return self.lr * warm * (
             self.floor + self.scale * 0.5 * (1 + math.cos(math.pi * step / self.steps)))
 
     def apply(self, opt, step: int) -> float:
@@ -101,12 +108,16 @@ def build_schedule(spec: dict, opt, steps: int, lr: float):
     elif kind == "cosine":
         t_max = spec.pop("t_max", steps)
         eta_min = spec.pop("eta_min", 0.0)
+        if int(t_max) <= 0:
+            raise ValueError(f"调度 cosine 的 t_max 应 > 0，收到 {t_max}")
         sched, manual = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=t_max,
                                                                    eta_min=eta_min), None
     elif kind == "onecycle":
         kw = {k: spec.pop(k) for k in ("pct_start", "anneal_strategy", "div_factor",
                                        "final_div_factor") if k in spec}
         total = spec.pop("total_steps", steps)
+        if int(total) <= 0:
+            raise ValueError(f"调度 onecycle 的 total_steps 应 > 0，收到 {total}")
         sched, manual = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=total,
                                                             **kw), None
     elif kind == "lambda":
@@ -115,13 +126,22 @@ def build_schedule(spec: dict, opt, steps: int, lr: float):
         if "fn_kwargs" in spec:
             fn = fn(**spec.pop("fn_kwargs"))
         sched, manual = torch.optim.lr_scheduler.LambdaLR(opt, fn), None
-    elif kind == "warmup_cosine_floor":
-        manual = ManualSchedule(lr, _resolve_warmup(spec, steps), spec.pop("floor"),
-                                spec.pop("scale"), spec.pop("steps", steps))
-        sched = None
-    elif kind == "warmup_then_cosine":
-        manual = WarmupThenCosine(lr, _resolve_warmup(spec, steps), spec.pop("floor"),
-                                  spec.pop("scale"), spec.pop("steps", steps))
+    elif kind in ("warmup_cosine_floor", "warmup_then_cosine"):
+        # 两个手写调度吃同一组参数；floor / scale / 余弦窗口（steps）缺一个或 ≤ 0 都要
+        # 在**构建时**说清楚，不能等训练循环里除零 / KeyError 才炸
+        missing = [k for k in ("floor", "scale") if k not in spec]
+        if missing:
+            raise ValueError(f"调度 {kind} 缺少必填参数 {missing}")
+        warmup = _resolve_warmup(spec, steps)
+        if warmup < 0:
+            raise ValueError(f"调度 {kind} 的 warmup 应 >= 0（0 = 没有 warmup），收到 {warmup}")
+        window = int(spec.pop("steps", steps))
+        if window <= 0:
+            raise ValueError(f"调度 {kind} 的余弦窗口 steps 应 > 0，收到 {window}")
+        if kind == "warmup_cosine_floor":
+            manual = ManualSchedule(lr, warmup, spec.pop("floor"), spec.pop("scale"), window)
+        else:
+            manual = WarmupThenCosine(lr, warmup, spec.pop("floor"), spec.pop("scale"), window)
         sched = None
     if spec:
         raise ValueError(f"调度 {kind} 有未知参数 {sorted(spec)}")

@@ -53,7 +53,14 @@
     {selfplay_dir}     本代自对弈目录
     {selfplay_files}   最近 window 代（含本代）的全部自对弈分片路径列表
 
-状态文件 ``<out>/loop_state.json``：``{"generation", "phase", "champion", "history": [...]}``。
+**启动时的配置体检**（只告警、不拦，写进日志/终端）：
+循环不认识的 ``{token}``（拼错的占位符，dict 键里的占位符——键本来就不替换）；
+用 ``train.variants`` 时 ``train.screen`` 与 ``arena.match`` 的开局库一边有一个没有
+（``MatchConfig.openings`` 缺省 ``"bundled"``，一边一个 = 筛选赛与 arena 的开局分布不同）；
+锁定配置来自已不在 ``train.variants`` 里的变体（网格换过了）。
+
+状态文件 ``<out>/loop_state.json``：``{"generation", "phase", "champion", "history": [...]}``
+（``phase == "search"`` 时带 ``variant`` / ``train_variant``，中断续跑靠它们找胜者路径）。
 """
 from __future__ import annotations
 
@@ -61,9 +68,11 @@ import argparse
 import copy
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -71,6 +80,14 @@ from .. import IMPORT_ROOT
 from ..runtime.locks import FileLock
 
 PHASES = ("selfplay", "train", "search", "arena")
+
+# 循环自己认识的模板占位符。别的花括号 token（如训练导出名里的 {step}）留给子进程解释；
+# 拼错的占位符（{selfplay_dirr}）不会被替换，却会原样带进子进程配置里，直到要写文件
+# 那一刻才炸——所以启动时对配置里的 token 做一次体检，只告警不拦。
+PLACEHOLDERS = ("{weights}", "{candidate}", "{gen}", "{gen_dir}", "{selfplay_dir}",
+                "{selfplay_files}")
+_OTHER_TOKENS = ("{step}",)          # Kit/train 的 export.every_name 用
+_TOKEN = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
 def _merge(base, over):
@@ -81,6 +98,44 @@ def _merge(base, over):
             out[k] = _merge(base.get(k), v) if k in base else copy.deepcopy(v)
         return out
     return copy.deepcopy(over)
+
+
+def _apply_overrides(base: dict, over: dict) -> dict:
+    """训练模板 base + 覆盖字段 over；``schedule`` 整体替换而不是递归合并。
+
+    ``schedule`` 是自含的小字典，合并会留下对方的键（例如基座
+    ``{"kind":"onecycle","pct_start":0.25}`` 加上覆盖的 ``{"kind":"constant"}`` 就成了
+    ``{kind: constant, pct_start: 0.25}``，``build_schedule`` 会以「未知参数」为由报错）。
+    两个调用方（变体训练、枚举用尽后按锁定配置训练）必须是同一套语义。
+    """
+    base, over = copy.deepcopy(base), copy.deepcopy(over)
+    base_sched, over_sched = base.pop("schedule", None), over.pop("schedule", None)
+    conf = _merge(base, over)
+    sched = over_sched if over_sched is not None else base_sched
+    if sched is not None:                      # 都没有时不写这个键：保持 TrainConfig 缺省
+        conf["schedule"] = copy.deepcopy(sched)
+    return conf
+
+
+def _unknown_tokens(obj, found=None) -> list:
+    """配置里循环不认识的 ``{token}``（含字符串值、dict 键、列表元素）。
+
+    dict 的键不做占位符替换，所以键里的占位符会整个失效；一并报出来。
+    """
+    if found is None:
+        found = []
+    if isinstance(obj, str):
+        for tok in _TOKEN.findall(obj):
+            if tok not in PLACEHOLDERS and tok not in _OTHER_TOKENS and tok not in found:
+                found.append(tok)
+    elif isinstance(obj, list):
+        for x in obj:
+            _unknown_tokens(x, found)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _unknown_tokens(k, found)
+            _unknown_tokens(v, found)
+    return found
 
 
 def _subst(obj, mapping: dict):
@@ -111,6 +166,11 @@ class Loop:
                                "enumerate_generations"}
         if unknown:
             raise ValueError(f"loop 配置有未知字段 {sorted(unknown)}")
+        tokens = _unknown_tokens(conf)
+        if tokens:
+            warnings.warn(f"loop 配置里有循环不认识的占位符 {tokens}：循环只替换 "
+                          f"{list(PLACEHOLDERS)}（dict 的键不做替换），拼错的占位符会"
+                          f"原样带进子进程配置里", stacklevel=2)
         self.conf = conf
         out = Path(conf["out"])
         self.out = out if out.is_absolute() else (base_dir / out).resolve()
@@ -136,6 +196,23 @@ class Loop:
             screen = conf["train"].get("screen") or {}
             if not screen.get("pairs"):
                 raise ValueError("用 variants 时必须给 train.screen.pairs（候选对冠军的筛选赛场数）")
+            self._warn_screen_arena_openings(screen, conf["arena"]["match"])
+
+    def _warn_screen_arena_openings(self, screen: dict, arena_match: dict) -> None:
+        """筛选赛与最终 arena 的开局库必须一致（一边给了另一边没给就喊出来）。
+
+        ``MatchConfig.openings`` 缺省是 ``"bundled"``（Kit 的 34 条开局），而 arena.match
+        通常显式指向合成开局库：这时 ``train.screen`` 不写 ``openings`` 就会**静默**用
+        bundled 跑筛选赛。2026-09-27 loop_p4_v2 gen 0 正是如此——旧进程按内存里的旧配置
+        写出 ``openings: "bundled"``，十场筛选赛实际跑在 34 条开局上（duplicate_rate
+        0.27~0.375、只摊到 32 条线路），选出的是「按别的开局分布」最优的变体，arena 却
+        用合成库，两边的结论互不相干。两者差一个，筛选就等于白跑。
+        """
+        screen_book, arena_book = screen.get("openings"), arena_match.get("openings")
+        if bool(screen_book) != bool(arena_book):
+            warnings.warn(f"train.screen.openings={screen_book!r} 与 arena.match.openings="
+                          f"{arena_book!r} 不一致（MatchConfig 缺省 bundled）：筛选赛与最终"
+                          f"arena 的开局分布不同，筛选选出的变体未必适合 arena", stacklevel=2)
 
     # ---------------------------------------------------------------- 状态
     def load_state(self) -> dict:
@@ -189,17 +266,12 @@ class Loop:
         ``schedule`` 是**整体替换**而不是合并：它是自含的小字典，合并会留下对方的键
         （例如基座 ``{"kind":"onecycle","pct_start":0.25}`` 加上变体的
         ``{"kind":"constant"}`` 就成了 ``{kind: constant, pct_start: 0.25}``，
-        ``build_schedule`` 会以「未知参数」为由报错）。
+        ``build_schedule`` 会以「未知参数」为由报错）。锁定配置那一侧同理，见
+        ``_apply_overrides``。
         """
-        base = self._base_train()
         over = copy.deepcopy(variant)
         label = over.pop("label")
-        base_sched, over_sched = base.pop("schedule", None), over.pop("schedule", None)
-        conf = _merge(base, over)
-        if over_sched is not None:
-            conf["schedule"] = copy.deepcopy(over_sched)
-        elif base_sched is not None:
-            conf["schedule"] = copy.deepcopy(base_sched)
+        conf = _apply_overrides(self._base_train(), over)
         conf["out"] = str(Path(m["{gen_dir}"]) / f"train_{label}")
         return _subst(conf, m)
 
@@ -233,7 +305,8 @@ class Loop:
             rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
                                 cwd=str(self.out)).returncode
         if rc != 0:
-            raise RuntimeError(f"{subcmd} 子进程退出码 {rc}，见 {log_path}")
+            raise RuntimeError(f"{subcmd} 子进程退出码 {rc}（配置 {cfg_path}，"
+                               f"日志 {log_path}）")
 
     def phase_selfplay(self, g: int, m: dict) -> None:
         gd = self.gen_dir(g)
@@ -247,10 +320,7 @@ class Loop:
 
     def _fixed_train_conf(self, m: dict, overrides: dict) -> dict:
         """枚举次数用完后，按锁定的变体配置训练（无筛选赛，产物落 ``gen_XXXX/train/``）。"""
-        base = copy.deepcopy(self.conf["train"])
-        base.pop("variants", None)
-        base.pop("screen", None)
-        conf = _merge(base, overrides)
+        conf = _apply_overrides(self._base_train(), overrides)
         conf["out"] = str(Path(m["{gen_dir}"]) / "train")
         return _subst(conf, m)
 
@@ -282,6 +352,28 @@ class Loop:
             return {}
         return {k: v for k, v in res[label]["config"].items()}
 
+    def _drop_stale_results(self, results: dict, done_path: Path) -> dict:
+        """丢掉不属于当前 ``train.variants`` 网格的结果条目。
+
+        2026-09-27 loop_p4_v2 的实况：gen 0 的 ``search.json`` 是旧网格（10 个恒定 lr
+        变体）写的，换成新网格的配置再重启 loop → 新 label 不在 results 里，得全部重跑
+        （1.5h GPU）；跑完 ``len(results)`` = 旧 10 + 新 8 = 18 ≠ 8，撞「变体结果不齐」
+        报错。而旧 label 还留在文件里，之后再重启也永远过不了这个校验——loop 被永久卡死
+        在这一代，只能手工删 ``search.json``（把新变体已跑出的成绩一起丢掉）。
+
+        网格换过了，旧 label 的成绩对新网格没有意义，扔掉重跑才对。
+        """
+        labels = {v["label"] for v in self.variants}
+        stale = sorted(k for k in results if k not in labels)
+        if not stale:
+            return results
+        for k in stale:
+            results.pop(k)
+        _write_json(done_path, results)
+        warnings.warn(f"search.json 里有 {stale} 条不在 train.variants 里的结果"
+                      f"（网格换过了）：已丢弃并按新网格重跑这些变体", stacklevel=2)
+        return results
+
     def _search_all(self, g: int, m: dict) -> str:
         """逐个变体：训练 → 对冠军筛选赛 → 记录结果。返回得分最高变体的 label。
 
@@ -294,6 +386,7 @@ class Loop:
         results = (json.loads(done_path.read_text(encoding="utf-8")) if done_path.exists()
                    else {})
         results.pop("_selected", None)
+        results = self._drop_stale_results(results, done_path)
         for variant in self.variants:
             label = variant["label"]
             if label in results:
@@ -382,8 +475,11 @@ class Loop:
                 # phase_train 用的 train/ 路径，而 search 代的胜者在 train_<label>/ 下。
                 # （2026-09-27 实测：在 arena 阶段重启 loop → FileNotFoundError:
                 #   .../gen_0000/train/final.pt）
+                # variant 优先读状态文件；老版本 / 手改过的状态文件可能没写这个字段，
+                # 退回本代 search.json 的 _selected（胜者的权威记录在那）。
                 if st["phase"] == "arena":
-                    m = {**m, "{candidate}": self.candidate_path(g, st.get("variant"))}
+                    variant = st.get("variant") or self._search_results(g).get("_selected")
+                    m = {**m, "{candidate}": self.candidate_path(g, variant)}
                 t0 = time.time()
                 if st["phase"] == "selfplay":
                     self.phase_selfplay(g, m)
@@ -399,7 +495,16 @@ class Loop:
                     _write_json(self.state_path, st)
                 if st["phase"] == "train":
                     # 枚举已结束的代：按上一代选中变体的配置训练（search 里不再跑筛选赛）
-                    self.phase_train(g, m, st.get("train_variant") or None)
+                    locked = st.get("train_variant") or None
+                    if locked:
+                        src = st.get("variant")
+                        if src is not None and src not in {v["label"] for v in self.variants}:
+                            warnings.warn(
+                                f"gen {g} 的锁定配置来自变体 {src!r}，但它已不在 train.variants"
+                                f" 里（网格换过了）：仍按旧网格胜者 {sorted(locked)} 训练，"
+                                f"不重新枚举。要用新网格就删掉 loop_state.json 的 "
+                                f"train_variant 字段再续跑", stacklevel=2)
+                    self.phase_train(g, m, locked)
                     st["phase"] = "arena"
                     _write_json(self.state_path, st)
                 if st["phase"] == "arena":
@@ -411,7 +516,13 @@ class Loop:
                            "sprt": (summary.get("sprt") or {}).get("verdict"),
                            "sec": round(time.time() - t0, 1)}
                     if self.variants:
-                        rec["variant"] = st.get("variant")
+                        if self.uses_search(g):
+                            rec["variant"] = st.get("variant")
+                        else:
+                            # 锁定代没跑枚举：variant 是上一次 search 的胜者，
+                            # 不能冒充本代选出来的；把锁定配置一并记下来备查
+                            rec["variant"] = None
+                            rec["locked_train_variant"] = st.get("train_variant") or None
                         rec["search"] = {k: {"score_a": v["score_a"], "elo": v["elo"],
                                              "games": v["games"]}
                                          for k, v in self._search_results(g).items()
