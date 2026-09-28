@@ -61,7 +61,13 @@ class SelfPlayShardSink:
             if self.path.exists() else 0
 
     def _repair(self) -> None:
-        """截掉写了一半的尾巴：分片按元数据记录的总条数截断，元数据去掉残行。"""
+        """截掉写了一半的尾巴：分片按元数据记录的总条数截断，元数据去掉残行。
+
+        只允许**截小**：分片比元数据还短时（元数据留着、分片被外部截断 / 删掉 / 只拷了
+        一半）说明两边已经对不上，必须报错——``truncate`` 往大改会把分片用零字节撑到
+        元数据说的长度，多出来的"记录"棋盘字段全零、z/q 全零，``open_shard`` 还校验得过，
+        训练侧默默读进一批空局面噪声（2026-09-27 补：宁可拒绝续跑，不留垃圾数据）。
+        """
         n = 0
         lines = []
         if self.meta.exists():
@@ -74,9 +80,15 @@ class SelfPlayShardSink:
                 n += int(rec["records"])
             self.meta.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
         size = n * SELFPLAY_DTYPE.itemsize
-        if self.path.exists() and self.path.stat().st_size != size:
+        actual = self.path.stat().st_size if self.path.exists() else 0
+        if actual > size:
+            # 写了一半的尾巴（或元数据整体丢失）：截回整数条，宁少勿假
             with open(self.path, "r+b") as f:
                 f.truncate(size)
+        elif n and actual < size:
+            raise ValueError(f"{self.path} 只有 {actual} 字节，元数据记录了 {n} 条共 {size} "
+                             f"字节：分片比元数据短，无法安全续跑（截大只会造出全零记录），"
+                             f"请核对这两个文件")
 
     def done_games(self) -> set:
         if not self.meta.exists():

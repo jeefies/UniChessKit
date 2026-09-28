@@ -6,6 +6,8 @@ S 的 d87371c 教训：子进程静默退出（OOM、被 kill、C 扩展段错�
 - 每个 worker 必须以一条 ``("done", wid, None)`` 或 ``("error", wid, traceback)`` 收尾；
 - 进程已退出却没发过收尾消息 → 视为错误（报告退出码）；
 - 任何一个 worker 出错 → 置停止事件，其余 worker 尽快结束，run() 抛 WorkerError。
+  **不能无限等其余 worker**：万一边上有个卡死的（CUDA 调用不返回、不看 stop_event），
+  父进程会永远等下去，把挂死伪装成"运行中"——出错后再等 ``error_grace_s`` 秒就强杀。
 
 2026-09-26 的新教训：**父进程被杀时 worker 不会自己退**。spawn 出来的 worker cmdline 是
 ``python -c from multiprocessing.spawn import spawn_main ...``，``pkill -f 'Kit match'``
@@ -23,11 +25,17 @@ import multiprocessing as mp
 import os
 import queue as queue_mod
 import threading
+import time
 import traceback
 from typing import Any, Callable, Optional, Sequence
 
 GRACE_S = 10.0        # 看门狗发现父进程死后给 fn 的收尾宽限
 POLL_S = 1.0          # 看门狗的轮询间隔
+ERROR_GRACE_S = 300.0  # 出错（含静默退出）后等其余 worker 收尾的宽限；不无限等。
+# 为什么不是 10 s：arena / 筛选赛单局 20~45 s（2400 sims）、自对弈更长，出错时另一个
+# worker 通常正在下在途局。本文件的既有口径是"已开局的照常下完并入库"——宽限必须够
+# 一局下完（所以取分钟级），只用来防"某个 worker 卡死 + 不看 stop_event → 父进程永远
+# 等下去、把挂死伪装成运行中"。真要早报错，构造 WorkerPool 时传 error_grace_s 覆盖。
 
 
 class WorkerError(RuntimeError):
@@ -100,14 +108,16 @@ def _entry(fn, wid, task, q, stop_event, alive_r=None):
 
 
 class WorkerPool:
-    def __init__(self, start_method: str = "spawn", poll_s: float = 0.5):
+    def __init__(self, start_method: str = "spawn", poll_s: float = 0.5,
+                 error_grace_s: float = ERROR_GRACE_S):
         # 默认 spawn：CUDA 在 fork 出来的子进程里不能用；spawn 也让 Windows / Linux 行为一致
         self.ctx = mp.get_context(start_method)
         self.poll_s = poll_s
+        self.error_grace_s = error_grace_s
 
     def run(self, fn: Callable, tasks: Sequence[Any],
-             on_result: Callable[[int, Any], None],
-             should_stop: Callable[[], bool] = lambda: False) -> None:
+            on_result: Callable[[int, Any], None],
+            should_stop: Callable[[], bool] = lambda: False) -> None:
         q = self.ctx.Queue()
         stop_event = self.ctx.Event()
         # 父进程活着凭据：写端由父进程持有且不写数据；父进程一死（含被 SIGKILL）
@@ -121,8 +131,21 @@ class WorkerPool:
             p.start()
         finished: set = set()
         errors: list = []
+        grace_until: Optional[float] = None   # 出错后等其余 worker 收尾的宽限时刻
+        force = False                         # 宽限已过：剩下的 worker 直接强杀
         try:
             while len(finished) < len(procs):
+                if errors and grace_until is None:
+                    # 出错整批停止：停止事件已置，守规矩的 worker 会尽快收尾；但万一有
+                    # worker 卡死（CUDA 调用不返回）又不看 stop_event，无限等下去会把
+                    # 它伪装成「还在跑」——父进程在 q.get 上空转，整批永无结论。
+                    grace_until = time.monotonic() + self.error_grace_s
+                if grace_until is not None and time.monotonic() >= grace_until:
+                    laggards = sorted(set(procs) - finished)
+                    errors.append(f"worker {laggards} 未在 {self.error_grace_s:g}s 宽限内"
+                                  f"收尾（出错整批停止，强制结束）")
+                    force = True
+                    break
                 try:
                     kind, wid, payload = q.get(timeout=self.poll_s)
                 except queue_mod.Empty:
@@ -143,8 +166,9 @@ class WorkerPool:
                     stop_event.set()
         finally:
             stop_event.set()
+            join_s = 0.1 if force else 30     # 已判定卡死就别再陪等 30s
             for p in procs.values():
-                p.join(timeout=30)
+                p.join(timeout=join_s)
                 if p.is_alive():
                     p.terminate()
                     p.join(timeout=5)

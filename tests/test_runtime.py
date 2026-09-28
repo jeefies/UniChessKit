@@ -149,12 +149,35 @@ class TestWorkerPool(unittest.TestCase):
         with self.assertRaisesRegex(WorkerError, "静默退出"):
             WorkerPool(poll_s=0.2).run(fakes.crash_worker, [None], lambda w, x: got.append(x))
 
+    def test_error_does_not_wait_for_wedged_worker(self):
+        """出错后不许无限等其余 worker：卡死的那个会把 run() 变成永久挂起。
+
+        2026-09-27 修：worker 0 被 OOM kill（静默退出，已计入 errors），worker 1 卡在
+        CUDA 调用里、根本不看 stop_event → 旧代码 ``while len(finished) < len(procs)``
+        在 q.get 上永远等不到 worker 1 的收尾消息，``Kit match --workers 2`` 像还在跑，
+        实际毫无进展（挂死比报错更难发现，正是不变式"出错整批停止"要防的）。
+        现在出错后只宽限 ``error_grace_s`` 秒就强杀并抛错。
+        """
+        with self.assertRaisesRegex(WorkerError, "静默退出"):
+            WorkerPool(poll_s=0.1, error_grace_s=1.0).run(
+                _crash_or_wedge, ["crash", "wedge"], lambda w, x: None)
+
 
 def _spin_worker(wid, task, emit, stop_event):
     """一直转到 stop_event 被置（模拟正在跑一局长赛的 match worker）。"""
     while not stop_event.is_set():
         stop_event.wait(0.1)
     emit("stopped")
+
+
+def _crash_or_wedge(wid, task, emit, stop_event):
+    """task == "crash"：沉默退出（不发 done/error）；task == "wedge"：无限转且不理 stop_event。"""
+    import os
+    if task == "crash":
+        emit({"wid": wid})
+        os._exit(3)
+    while True:
+        stop_event.wait(0.1)
 
 
 class TestParentDeathWatchdog(unittest.TestCase):

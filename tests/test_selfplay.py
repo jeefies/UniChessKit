@@ -1,9 +1,11 @@
 """自对弈管线（``pipelines.selfplay``）测试：开局分配、种子、book 强制、裁决、Sink 契约、攒批。"""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import chess
 import numpy as np
@@ -110,6 +112,22 @@ class TestPlanning(unittest.TestCase):
         self.assertEqual(lines[2], ("c2c4",))
         self.assertEqual(lines[3], ("d2d4", "d7d5"))
 
+    def test_book_lines_drop_null_move(self):
+        """"0000"：解析期就要丢掉，不能带进对局。
+
+        2026-09-27 修：python-chess 的 parse_san 把 "0000" 当 null move 收下，
+        ``load_book_lines`` 原来会留下 ``("e2e4", "e7e5", "0000")`` 这种"合法"行——
+        selfplay 跑到这一 ply 才 PlayerError 整批中止（算力全废），arena 则 push 成
+        空着悄悄翻转行棋方。现在 parse_line 直接拒绝，这里记 dropped。
+        """
+        path = _write(["e4 e5 Nf3", "e4 e5 0000", "0000", "d2d4 d7d5"])
+        try:
+            lines, dropped = load_book_lines(path, 6)
+        finally:
+            os.unlink(path)
+        self.assertEqual(dropped, 2)
+        self.assertEqual(lines, [("e2e4", "e7e5", "g1f3"), ("d2d4", "d7d5")])
+
     def test_plan_round_robin(self):
         cfg = SelfPlayConfig(games=7)
         lines = [("e2e4",), ("d2d4",), ("c2c4",)]
@@ -212,6 +230,90 @@ class TestRunSelfPlay(unittest.TestCase):
                 self._run(1, openings=path)
         finally:
             os.unlink(path)
+
+
+class TestSelfPlayShardSink(unittest.TestCase):
+    """run_selfplay → SelfPlayShardSink 全链路口径（fake 引擎，不落正式目录）。
+
+    钉住 2026-09-27 核对过的三条口径：
+    - **每局记录数 == plies − book_plies**：开局书着法原样走、不搜索（无访问分布），
+      sink 跳过——文档里"arena 记录数 = plies − 6 个开局 ply"说的就是这件事；
+    - 分片大小始终是 160 字节的整数倍，元数据与分片逐局对得上；
+    - 重开 sink（续跑）能跳过已写的局，同一批任务不会重复落盘。
+    """
+
+    def _run(self, d, path, **kw):
+        from Kit.planes19 import records as R
+        from Kit.planes19.sink import SelfPlayShardSink
+        from Kit.players import SearchPlayer
+        from Kit.planes19 import Planes19Expander
+        from Kit.search import PUCTConfig
+        from Kit.testing.fakes import FakePlanesEvaluator
+
+        ev = FakePlanesEvaluator("fake:sink")
+
+        def make():
+            return SearchPlayer("probe", Planes19Expander(ev), simulations=8,
+                                puct=PUCTConfig(batch_size=8))
+
+        sink = SelfPlayShardSink(Path(d) / path)
+        cfg = SelfPlayConfig(games=4, seed=7, max_plies=24, concurrency=2, **kw)
+        summary = run_selfplay(cfg, make, sink)
+        return summary, sink, R.SELFPLAY_DTYPE.itemsize
+
+    def test_records_exclude_book_plies_and_resume_skips(self):
+        book = _write(["e2e4 e7e5 g1f3 b8c6 f1b5 a7a6", "d2d4 d7d5"])
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                summary, sink, isz = self._run(d, "sp_0000.sp.bin", openings=book, book_plies=6)
+                shard = Path(d) / "sp_0000.sp.bin"
+                meta = [json.loads(l) for l in
+                        (Path(d) / "sp_0000.games.jsonl").read_text(encoding="utf-8")
+                        .splitlines()]
+                self.assertEqual(summary["games"], 4)
+                self.assertEqual(len(meta), 4)
+                self.assertEqual(shard.stat().st_size, sink.records * isz)
+                self.assertEqual(sink.records, sum(m["records"] for m in meta))
+                self.assertEqual(sink.done_games(), {0, 1, 2, 3})
+                for m in meta:
+                    task_book = 6 if m["game"] % 2 == 0 else 2
+                    self.assertLessEqual(m["plies"], 24)
+                    self.assertEqual(m["records"], m["plies"] - task_book,
+                                     f"第 {m['game']} 局：记录数必须是 plies − 开局 ply 数")
+                # 记录里的 ply 不含开局 ply（开局着法没有访问分布）
+                from Kit.planes19 import records as R
+                mm = R.open_shard(shard)
+                rows = [(int(r["game"]), int(r["ply"])) for r in mm]
+                del mm                        # 先关掉内存映射：Windows 上临时目录才删得掉
+                by_game = {}
+                for gid, ply in rows:
+                    by_game.setdefault(gid, []).append(ply)
+                for m in meta:
+                    plies = by_game[m["game"]]
+                    self.assertEqual(len(plies), m["records"])
+                    self.assertEqual(plies, list(range(plies[0], plies[0] + len(plies))))
+                    self.assertGreaterEqual(plies[0], 6 if m["game"] % 2 == 0 else 2)
+                # 续跑：同样的任务全被跳过，分片不再长
+                summary2 = run_selfplay(SelfPlayConfig(games=4, seed=7, max_plies=24,
+                                                        concurrency=2, openings=book,
+                                                        book_plies=6),
+                                        self._make_player(), sink,
+                                        skip_games=sink.done_games())
+                self.assertEqual(summary2["games"], 0)
+                self.assertEqual(shard.stat().st_size, sink.records * isz)
+        finally:
+            os.unlink(book)
+
+    @staticmethod
+    def _make_player():
+        from Kit.planes19 import Planes19Expander
+        from Kit.players import SearchPlayer
+        from Kit.search import PUCTConfig
+        from Kit.testing.fakes import FakePlanesEvaluator
+
+        ev = FakePlanesEvaluator("fake:sink")
+        return lambda: SearchPlayer("probe", Planes19Expander(ev), simulations=8,
+                                    puct=PUCTConfig(batch_size=8))
 
 
 class TestPerGameSeed(unittest.TestCase):

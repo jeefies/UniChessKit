@@ -87,6 +87,42 @@ class TestOpenings(unittest.TestCase):
         self.assertEqual(len(OpeningBook.from_file(p)), 2)
         self.assertEqual(len(OpeningBook.from_file(p, max_plies=2)), 1)
 
+    def test_null_move_token_rejected(self):
+        """"0000" 必须按非法行处理：python-chess 把它当 null move 收下，不是开局着法。
+
+        2026-09-27 修：文件里混入 "0000"（占位符 / 导出错误）时，strict 的
+        ``from_file`` 收下、selfplay 的 ``load_book_lines`` 也收下 → selfplay 跑到这一 ply
+        才 PlayerError 整批中止（半小时算力打水漂），arena 则把空着 push 进棋盘
+        （翻转行棋方）悄悄制造坏棋谱。这里钉住两个入口都在**解析期**拒绝。
+        """
+        for text in ("0000", "e4 e5 0000", "e2e4 e7e5 d2d4 0000 d7d5"):
+            with self.assertRaises(ValueError, msg=text):
+                parse_line(text)
+        # 合法着法不能被误伤（UCI / SAN / 易位 / 兵步）
+        self.assertEqual(parse_line("e4 e5 Nf3"), ("e2e4", "e7e5", "g1f3"))
+        bad = self.write("e4 e5\ne4 e5 0000\n")
+        with self.assertRaises(ValueError):
+            OpeningBook.from_file(bad)                    # strict：直接报错
+        lenient = OpeningBook.from_file(bad, strict=False)
+        self.assertEqual((len(lenient), lenient.skipped), (1, [2]))   # lenient：记行号
+
+    def test_plan_wraps_uniformly_over_bundled_book(self):
+        """开局池不够用时循环复用必须**均匀**：库规模整除对数时每条线被摊到的次数相同。
+
+        2026-09-27 的口径核对：bundled 库 32 条（文件 34 行里 2 行是注释/空行），
+        arena 384 局 = 192 对，192 整除 32 → 每条线正好 6 对 12 局。这正是线上
+        loop_p4 观察到的现象，不是 bug；反过来若摊得不均，说明 plan 的取模环坏了。
+        """
+        book = OpeningBook.bundled()
+        n = len(book)
+        for pairs in (n, 2 * n, 192):
+            counts = {}
+            for idx, _ in book.plan(pairs, seed=20260927):
+                counts[idx] = counts.get(idx, 0) + 1
+            self.assertEqual(pairs % n, 0, "测试前提：对数整除库规模")
+            self.assertEqual(sorted(counts.values()), [pairs // n] * n, f"pairs={pairs}")
+            self.assertEqual(len(counts), n)
+
     def test_bundled_openings_legal_and_distinct(self):
         book = OpeningBook.bundled()
         self.assertTrue(BUNDLED_OPENINGS.exists())

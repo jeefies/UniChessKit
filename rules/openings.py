@@ -30,7 +30,7 @@ def parse_line(text: str) -> tuple:
         move = None
         try:
             cand = chess.Move.from_uci(tok)
-            if cand in board.legal_moves:
+            if cand and cand in board.legal_moves:
                 move = cand
         except ValueError:
             pass
@@ -39,6 +39,12 @@ def parse_line(text: str) -> tuple:
                 move = board.parse_san(tok)
             except ValueError as e:
                 raise ValueError(f"开局 {text!r} 第 {len(out) + 1} 着 {tok!r} 非法：{e}") from None
+        if not move:
+            # "0000"：python-chess 的 from_uci / parse_san 都认 null move，但它不是开局着法——
+            # 混进文件后 selfplay 会在跑到这一 ply 时 PlayerError 整批中止，arena 则把
+            # 空着 push 进棋盘（翻转行棋方）悄悄制造坏棋谱，所以这里按非法行处理。
+            raise ValueError(f"开局 {text!r} 第 {len(out) + 1} 着 {tok!r} 是空着"
+                             f"（null move），不是合法开局着法")
         out.append(move.uci())
         board.push(move)
     if board.is_game_over(claim_draw=True):

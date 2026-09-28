@@ -178,6 +178,35 @@ class TestSink(unittest.TestCase):
         sink2.on_game_end(rec, chess.Board(), decs)
         self.assertEqual(sink2.done_games(), {0})
 
+    def test_repair_rejects_shard_shorter_than_meta(self):
+        """分片比元数据还短：报错，绝不用零字节把分片撑大。
+
+        2026-09-27 修：旧 ``_repair`` 一律 ``truncate(元数据总字节)``，分片短于元数据时
+        truncate 是**往上撑**——多出来的"记录"棋盘字段全零、z/q 全零，``open_shard`` 的
+        整数倍校验还过得去，训练侧默默读进一批空局面噪声。诱因：只拷了 .games.jsonl
+        没拷 .sp.bin、分片被外部截断、手工改过元数据。复现：一局（160 字节）之后往
+        元数据里加一行 records=100 的假记录。
+        """
+        rec, decs = self._game(0)
+        self.sink.on_game_end(rec, chess.Board(), decs)
+        before = self.path.stat().st_size
+        self.assertGreater(before, 0)
+        meta = self.path.with_name("sp_0000.games.jsonl")
+        with open(meta, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"game": 1, "result": "1-0", "termination": "checkmate",
+                                "plies": 1, "records": 100}) + "\n")
+        with self.assertRaisesRegex(ValueError, "分片比元数据短"):
+            SelfPlayShardSink(self.path)
+        self.assertEqual(self.path.stat().st_size, before)   # 没被撑大，也没被改小
+
+    def test_repair_rejects_missing_shard(self):
+        """分片整个丢了、元数据还在：同样报错（否则那些局会被当成"已完成"）。"""
+        rec, decs = self._game(0)
+        self.sink.on_game_end(rec, chess.Board(), decs)
+        self.path.unlink()
+        with self.assertRaisesRegex(ValueError, "分片比元数据短"):
+            SelfPlayShardSink(self.path)
+
     def test_bad_suffix(self):
         with self.assertRaises(ValueError):
             SelfPlayShardSink(Path(self.d) / "x.bin")
