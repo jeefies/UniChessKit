@@ -181,7 +181,7 @@ class TestArenaResumeCandidate(unittest.TestCase):
     def test_resume_in_arena_falls_back_to_search_json(self):
         """状态文件没写 ``variant`` 时退回 ``search.json`` 的 ``_selected``。
 
-        ``5dac905`` 只认 ``st["variant"]``；老版本（或手改过）的状态文件没有这个字段，
+        ``98b2798`` 只认 ``st["variant"]``；老版本（或手改过）的状态文件没有这个字段，
         续跑又跌回 ``gen_XXXX/train/final.pt``。胜者的权威记录在 ``search.json`` 里，
         状态文件只是它的缓存。
         """

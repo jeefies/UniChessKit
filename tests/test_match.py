@@ -284,7 +284,7 @@ class TestMatch(Base):
     def test_resume_freezes_verdict_at_crossing(self):
         """续跑必须冻结"越界那一刻"的判决；H1 / H0 两个方向都不许被在途对局推翻。
 
-        6f91bd6 修的是**同一进程内**的冻结（``_Run.add`` 判停、``run_match`` 的 summary
+        4925c62 修的是**同一进程内**的冻结（``_Run.add`` 判停、``run_match`` 的 summary
         拿最终记录集重算），但续跑路径只是对**读回的全部记录**重算一遍。若进程在
         "越界已落盘、汇总还没写"的窗口里被杀（``workers=2`` 时停止后还有在途对局在补），
         恢复时那份记录集的 llr 往往已被拖回界内：续跑认为"还没停"，把剩下的对重新下一
