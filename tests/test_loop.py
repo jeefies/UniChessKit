@@ -442,6 +442,89 @@ class TestConfigSanityWarnings(unittest.TestCase):
                     loop.run()
 
 
+class TestPerGenerationSeeds(unittest.TestCase):
+    """``seed_base``：每代重新掷种子；不配则完全维持原行为。
+
+    Transformer loop_p4_v2 的真实动机（2026-09-30）：arena 连着六代用同一个
+    ``match.seed``，开局与配色都由那条固定流决定，等于每次都在**同一批固定局面**
+    上判决——测试集不是随机样本。训练的固定 seed 也让静态语料的洗牌顺序每代一样。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
+
+    def test_without_seed_base_nothing_changes(self):
+        """默认（不配 seed_base）：三个子配置的 seed 一律不动。"""
+        conf = _conf(self.tmp, train={"task": {"factory": "No.such:make_task",
+                                              "kwargs": {"base": "{weights}"}},
+                                      "steps": 5, "device": "cpu",
+                                      "optimizer": {"lr": 5e-06}})
+        loop = Loop(conf, self.tmp)
+        self.assertIsNone(loop._gen_seed(0, 1))
+        for g in (0, 1, 7):
+            loop._subst_seeds(g)
+        self.assertNotIn("seed", loop.conf["train"])
+        self.assertNotIn("seed", loop.conf["selfplay"])
+        self.assertNotIn("seed", loop.conf["arena"]["match"])
+
+    def test_seeds_differ_across_generations_but_stable_within(self):
+        conf = _conf(self.tmp, seed_base=20260930)
+        loop = Loop(conf, self.tmp)
+        a = loop._gen_seed(6, 1)
+        b = loop._gen_seed(7, 1)
+        self.assertNotEqual(a, b)
+        # 同一代重复派生必须相同（中断续跑不能换种子）
+        self.assertEqual(loop._gen_seed(6, 1), a)
+        # 同一代三种用途必须互不相同
+        s = {loop._gen_seed(6, w) for w in (1, 2, 3)}
+        self.assertEqual(len(s), 3)
+        # 必须在合法 int31 区间
+        for v in s:
+            self.assertTrue(0 <= v < 2 ** 31)
+
+    def test_subst_seeds_writes_all_three_and_idempotent(self):
+        conf = _conf(self.tmp, seed_base=20260930)
+        loop = Loop(conf, self.tmp)
+        loop._subst_seeds(7)
+        first = (dict(loop.conf["train"]), dict(loop.conf["selfplay"]),
+                 dict(loop.conf["arena"]["match"]))
+        loop._subst_seeds(7)                      # 再来一次必须不变（幂等）
+        self.assertEqual((dict(loop.conf["train"]), dict(loop.conf["selfplay"]),
+                          dict(loop.conf["arena"]["match"])), first)
+        self.assertEqual(loop.conf["train"]["seed"], loop._gen_seed(7, 1))
+        self.assertEqual(loop.conf["selfplay"]["seed"], loop._gen_seed(7, 2))
+        self.assertEqual(loop.conf["arena"]["match"]["seed"], loop._gen_seed(7, 3))
+        # 换代会换种子
+        loop._subst_seeds(8)
+        self.assertNotEqual(loop.conf["train"]["seed"], first[0]["seed"])
+        self.assertNotEqual(loop.conf["arena"]["match"]["seed"], first[2]["seed"])
+
+    def test_run_writes_seeds_into_history(self):
+        """整代跑通后，history 里要留下本代实际用的三个种子（换 seed_base 好对账）。"""
+        conf = _conf(self.tmp, seed_base=20260930, generations=2)
+        loop = Loop(conf, self.tmp)
+        loop.out.mkdir(parents=True, exist_ok=True)
+        gd = loop.gen_dir(1)
+        (gd / "train").mkdir(parents=True)
+        (gd / "train" / "final.pt").write_bytes(b"\0")
+        loop.state_path.write_text(json.dumps({
+            "generation": 1, "phase": "arena", "champion": "/w/c.pt", "history": [],
+            "variant": None}), encoding="utf-8")
+
+        def fake_arena(self, g, m):
+            (loop.gen_dir(g) / "arena.jsonl.summary.json").write_text(json.dumps(
+                {"score_a": 0.5, "elo": 0.0, "games": 10,
+                 "sprt": {"verdict": "H0"}}), encoding="utf-8")
+            return {"score_a": 0.5, "elo": 0.0, "games": 10, "sprt": {"verdict": "H0"}}
+
+        with mock.patch.object(Loop, "phase_arena", fake_arena):
+            loop.run()
+        rec = json.loads(loop.state_path.read_text(encoding="utf-8"))["history"][-1]
+        self.assertEqual(set(rec["seeds"]), {"train", "selfplay", "match"})
+        self.assertEqual(rec["seeds"]["train"], loop._gen_seed(1, 1))
+        self.assertEqual(rec["seeds"]["match"], loop._gen_seed(1, 3))
+
+
 class TestPromote(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))

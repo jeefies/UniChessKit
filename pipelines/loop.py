@@ -163,7 +163,7 @@ class Loop:
     def __init__(self, conf: dict, base_dir: Path, *, python: str = sys.executable):
         unknown = set(conf) - {"out", "generations", "initial", "games", "window", "engine",
                                "selfplay", "sink", "train", "export", "arena",
-                               "enumerate_generations"}
+                               "enumerate_generations", "seed_base"}
         if unknown:
             raise ValueError(f"loop 配置有未知字段 {sorted(unknown)}")
         tokens = _unknown_tokens(conf)
@@ -307,6 +307,42 @@ class Loop:
         if rc != 0:
             raise RuntimeError(f"{subcmd} 子进程退出码 {rc}（配置 {cfg_path}，"
                                f"日志 {log_path}）")
+
+    # ---------------------------------------------------------------- 每代种子
+    def _gen_seed(self, g: int, which: int) -> Optional[int]:
+        """按代派生种子；配置没给 ``seed_base`` 时返回 None（保持原行为）。
+
+        为什么需要它：arena 连着六代用同一个 ``match.seed``，开局与配色
+        都由那个固定流决定，等于每次都在**同一批固定局面**上判决——
+        那是测试集不是随机样本，系统性偏袒哪一边都不奇怪。
+        训练的固定 seed 也让静态语料的洗牌顺序每代一模一样
+        （``Kit/planes19/task._mix_batches`` 只认 data 的 ``seed``）。
+
+        派生是确定性的：中断续跑同一代会算出同一个种子，续跑不会换种子；
+        跨代则必然不同。换了 ``seed_base`` 就等于换整套种子序列，
+        想完全复现某一代就把它固定回去。
+        """
+        base = self.conf.get("seed_base")
+        if base is None:
+            return None
+        return (int(base) + which * 7919 + g * 104729) % (2 ** 31 - 1)
+
+    def _subst_seeds(self, g: int) -> None:
+        """把本代种子写回 self.conf 的 train / selfplay / arena.match 三处（原地）。
+
+        幂等：同一代重复调用得到同一结果，所以 ``run()`` 每轮开头调一次即可。
+        """
+        for which, keys in enumerate((("train",), ("selfplay",), ("arena", "match")), start=1):
+            seed = self._gen_seed(g, which)
+            if seed is None:
+                return
+            node = self.conf
+            for k in keys:
+                node = node.get(k)
+                if not isinstance(node, dict):
+                    break
+            if isinstance(node, dict):
+                node["seed"] = seed
 
     def phase_selfplay(self, g: int, m: dict) -> None:
         gd = self.gen_dir(g)
@@ -475,6 +511,9 @@ class Loop:
             _write_json(self.out / "loop_config.json", self.conf)
             while st["generation"] < int(self.conf["generations"]):
                 g = st["generation"]
+                # 每代重新掷种子（opt-in：配了 seed_base 才生效）。放在循环体最前面，
+                # 保证 train / selfplay / arena.match 三个子进程都吃到本代的种子。
+                self._subst_seeds(g)
                 self.gen_dir(g).mkdir(parents=True, exist_ok=True)
                 m = self.mapping(g, st["champion"])
                 # 续跑纠正候选路径：中断后 phase 停在 arena 时，mapping 只会给
@@ -521,6 +560,14 @@ class Loop:
                            "elo": summary.get("elo"), "games": summary.get("games"),
                            "sprt": (summary.get("sprt") or {}).get("verdict"),
                            "sec": round(time.time() - t0, 1)}
+                    # 本代实际用的种子一并留档：换了 seed_base 后要能对上是哪一套序列
+                    seeds = {k: self.conf[k]["seed"] for k in ("train", "selfplay")
+                             if isinstance(self.conf.get(k), dict) and "seed" in self.conf[k]}
+                    mk = (self.conf.get("arena") or {}).get("match") or {}
+                    if "seed" in mk:
+                        seeds["match"] = mk["seed"]
+                    if seeds:
+                        rec["seeds"] = seeds
                     if self.variants:
                         if self.uses_search(g):
                             rec["variant"] = st.get("variant")
