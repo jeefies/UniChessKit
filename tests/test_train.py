@@ -259,15 +259,27 @@ class TestSelectBestByTrain(unittest.TestCase):
         return make_config(out, steps=steps, log_every=log_every,
                            export={"best": "best.pt", "final": "final.pt", **export_extra})
 
-    def _loss_seq(self, name="train"):
+    def _read_log(self, name="train"):
+        """(全部记录, 有 loss 的记录, loss 序列)。
+
+        ``train.jsonl`` 里混着三种记录：训练日志点（有 ``loss``）、
+        best 追加记录（``best``/``improved``，无 ``loss``）、
+        validation 追加记录（``validation``/``best``/``improved``，无 ``loss``）。
+        算 loss 序列要过滤，查 ``improved`` / ``validation`` 必须看全部。
+        """
         recs = _losses(self.d / name / "train.jsonl")
-        return recs, [r["loss"] for r in recs]
+        loss_recs = [r for r in recs if "loss" in r]
+        return recs, loss_recs, [r["loss"] for r in loss_recs]
+
+    def _loss_seq(self, name="train"):
+        recs, loss_recs, losses = self._read_log(name)
+        return loss_recs, losses
 
     def test_best_falls_on_min_loss_step_not_final(self):
         cfg = self._cfg(self.d / "train", export_extra={"select_best_by": "train"})
         res = Trainer(cfg, VShapedLossTask(mid=20)).run()
         self.assertEqual(res["state"], "completed")
-        recs, losses = self._loss_seq("train")
+        recs, loss_recs, losses = self._read_log("train")
         argmin = int(np.argmin(losses)) + 1                 # 1-based 步号
         best = torch.load(self.d / "train" / "best.pt", weights_only=False)
         final = torch.load(self.d / "train" / "final.pt", weights_only=False)
@@ -330,6 +342,76 @@ class TestSelectBestByTrain(unittest.TestCase):
         best = torch.load(self.d / "part" / "best.pt", weights_only=False)
         self.assertEqual(best["step"], argmin_full,
                          "续跑后 best 仍应是全程 loss 最低点")
+
+    def test_select_best_by_train_with_scoreless_validate(self):
+        """validate 方法**存在**但拿不到 score 时，select_best_by 照样生效。
+
+        T/R 的 ``Planes19Task`` 自带 ``validate`` 方法，没配验证数据源时返回空 dict、
+        score 为 None——行为与没有 validate 完全一致。2026-09-30 把判据写成
+        ``validate is None``（方法不存在）导致分支永不触发、best_model.pt 不导出，
+        Transformer loop_p4_v2 gen 6 训练完成后 loop 直接崩在 phase_train。
+        这个用例就是钉住那条 bug 的。
+        """
+        class ScorelessValidateTask(VShapedLossTask):
+            """有 validate 方法但永远给不出 score（模拟没配 validation）。"""
+
+            def validate(self, model, ctx):
+                return {}
+
+        cfg = self._cfg(self.d / "sv", export_extra={"select_best_by": "train"})
+        res = Trainer(cfg, ScorelessValidateTask(mid=20)).run()
+        recs, loss_recs, losses = self._read_log("sv")
+        argmin = int(np.argmin(losses)) + 1
+        best = torch.load(self.d / "sv" / "best.pt", weights_only=False)
+        self.assertTrue((self.d / "sv" / "best.pt").exists(),
+                        "validate 拿不到 score 时也必须导出 best_model.pt")
+        self.assertEqual(best["step"], argmin)
+        # 日志里应有 validation 空记录（说明 do_val 真的走了）且有 improved
+        val_recs = [r for r in recs if "validation" in r]
+        self.assertTrue(val_recs, "validate 方法应在最后一步被调用")
+        self.assertTrue(any(r.get("improved") for r in recs),
+                        "至少一步应被记成 improved")
+        self.assertTrue(math.isfinite(res["best"]))
+
+    def test_completed_run_reentered_still_exports(self):
+        """训完后再拉起同一目录：final/best 都要重新导出，不能空手返回。
+
+        2026-09-30 实测：``step >= cfg.steps`` 的提前返回路径什么都不导出，
+        loop 重入 phase_train 时报「训练结束但没有导出候选」而崩。
+        """
+        cfg = self._cfg(self.d / "re", export_extra={"select_best_by": "train"})
+        Trainer(cfg, VShapedLossTask(mid=20)).run()
+        self.assertTrue((self.d / "re" / "best.pt").exists())
+        best_step_first = torch.load(self.d / "re" / "best.pt", weights_only=False)["step"]
+        final_step_first = torch.load(self.d / "re" / "final.pt", weights_only=False)["step"]
+        for f in ("final.pt", "best.pt"):
+            (self.d / "re" / f).unlink()
+        res = Trainer(cfg, VShapedLossTask(mid=20)).run()
+        self.assertEqual(res["state"], "completed")
+        self.assertEqual(res["step"], 40)
+        self.assertTrue((self.d / "re" / "final.pt").exists(),
+                        "已完成再进入也必须导出 final")
+        self.assertTrue((self.d / "re" / "best.pt").exists(),
+                        "已完成再进入也必须导出 best")
+        # 真实 best 权重不可重建，重入时只能拿最终步顶上
+        self.assertEqual(torch.load(self.d / "re" / "best.pt",
+                                    weights_only=False)["step"], 40)
+        self.assertEqual(final_step_first, 40)
+        self.assertNotEqual(best_step_first, 40,
+                            "第一次跑时 best 应落在 argmin（≠最后一步）")
+
+    def test_completed_run_reentered_keeps_existing_best(self):
+        """重入时磁盘上已有 best：不许用 final 覆盖掉真正的最优点。"""
+        cfg = self._cfg(self.d / "keep", export_extra={"select_best_by": "train"})
+        Trainer(cfg, VShapedLossTask(mid=20)).run()
+        good = torch.load(self.d / "keep" / "best.pt", weights_only=False)
+        (self.d / "keep" / "final.pt").unlink()
+        Trainer(cfg, VShapedLossTask(mid=20)).run()
+        after = torch.load(self.d / "keep" / "best.pt", weights_only=False)
+        self.assertEqual(after["step"], good["step"],
+                         "重入不应用 final 覆盖已有的 best")
+        for k in good["model"]:
+            self.assertTrue(torch.equal(after["model"][k], good["model"][k]), k)
 
 
 class VShapedLossTask(ToyTask):

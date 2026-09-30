@@ -325,7 +325,13 @@ class Loop:
         return _subst(conf, m)
 
     def phase_train(self, g: int, m: dict, overrides: Optional[dict] = None) -> None:
-        """单路径训练：``overrides`` 给出时按锁定的变体配置训练（枚举已结束）。"""
+        """单路径训练：``overrides`` 给出时按锁定的变体配置训练（枚举已结束）。
+
+        不检查候选是否已存在、每次都拉起训练子进程：``Trainer`` 自己会按
+        ``latest.pt`` 的 step 与配置哈希判断续跑还是重训，训完再按 ``export``
+        落盘（2026-09-30 补：``step >= steps`` 的提前返回路径也要导出，
+        否则 loop 重入本方法时会拿不到候选文件）。
+        """
         gd = self.gen_dir(g)
         conf = (self._fixed_train_conf(m, overrides) if overrides
                 else _subst(self._base_train(), m))
