@@ -11,7 +11,8 @@
      "schedule": {"kind": "onecycle", "pct_start": 0.05},
      "torch": {"num_threads": null, "cudnn_benchmark": false, "tf32": false},
      "log_every": 50, "save_every": 2000, "validate_every": 0, "validate_at": [],
-     "export": {"best": "best.pt", "final": "final.pt", "every": 0, "every_name": "step_{step:08d}.pt"},
+      "export": {"best": "best.pt", "final": "final.pt", "every": 0,
+                 "every_name": "step_{step:08d}.pt", "select_best_by": "none"},
      "runtime": {...}}
 
 - 相对路径（``out``）相对配置文件所在目录解析。
@@ -19,6 +20,11 @@
   ``latest.pt`` 里记着它，续训时不符直接拒绝（kit 纪律：结果文件不混口径）。
 - ``runtime`` 原样传给任务工厂（``task_factory(**kwargs, runtime=runtime)``），只影响怎么跑
   （worker 数、pin_memory 等），不进哈希。
+- ``export.select_best_by``：**没有 validation** 时 ``export.best`` 的取值口径。
+  ``none``（默认）= 训练结束时的 ``final``，即旧行为（``best`` 只是同名副本，
+  ``best`` 字段恒为 ``Infinity``）；``train`` = 训练 loss 最低的那一步导出到
+  ``export.best``。配了 ``validation`` 时该开关被忽略（按 validate 的 score 创新低导出）。
+  ``export`` 整体不进哈希，加这个开关不影响续训。
 """
 from __future__ import annotations
 
@@ -96,9 +102,13 @@ class TrainConfig:
                                      "cuda_mem_fraction"}
         if unknown:
             raise ValueError(f"torch 有未知字段 {sorted(unknown)}")
-        unknown = set(self.export) - {"best", "final", "every", "every_name"}
+        unknown = set(self.export) - {"best", "final", "every", "every_name", "select_best_by"}
         if unknown:
             raise ValueError(f"export 有未知字段 {sorted(unknown)}")
+        if self.export.get("select_best_by", "none") not in ("train", "none"):
+            raise ValueError("export.select_best_by 应为 ('train', 'none')：无 validation 时"
+                             "'train' 按训练 loss 最低的步导出 best，'none' 保持"
+                             "'best 即 final' 的旧行为")
 
     def to_dict(self) -> dict:
         return asdict(self)

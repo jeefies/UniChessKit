@@ -67,7 +67,7 @@ python -m unittest Kit.tests.test_puct -v
 python -m unittest Kit.tests.test_puct.test_terminal_sims_consume_budget -v
 ```
 
-`test_gpu.py` 依赖 GPU，无 GPU 的机器上会跳过。269 项（2026-09-25）。
+`test_gpu.py` 依赖 GPU，无 GPU 的机器上会跳过。远端 346 项（2026-09-30）；本机无 torch，`test_planes19_dataset` / `test_planes19_losses` / `test_train` 三个模块与 `TestParityWithR` 会因缺 torch 失败，是环境不是 regression。
 
 ## 开发
 

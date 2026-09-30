@@ -24,7 +24,9 @@
 目录内容（``cfg.out``）::
 
     latest.pt       续训状态（原子写）
-    <export.best>   task.validate 的 score 创新低时导出（引擎可直接加载的格式）
+    <export.best>   task.validate 的 score 创新低时导出（引擎可直接加载的格式）；
+                    没有 validation 时由 ``export.select_best_by`` 决定口径
+                    （``train`` = 训练 loss 最低的那一步；``none`` = 训练结束时的 final）
     <export.final>  训练结束时导出
     train.jsonl     每 log_every 步一行：step / lr / 各项损失（accum 内平均）/ grad_norm / 吞吐
     config.json     本次配置（含哈希）
@@ -306,6 +308,21 @@ class Trainer:
                     dt = time.time() - t0
                     rec["steps_per_s"] = round((step - step0) / max(dt, 1e-9), 3)
                     rec["sec"] = round(dt, 1)
+                    # 没有 validation 时按**训练 loss** 选「最优步」导出 best。
+                    # 否则 export.best 只是 final 的副本——``best`` 恒为 Infinity、
+                    # 日志里永远 ``improved=false``，看着像有早停其实没有。
+                    # 2026-09-30 实测教训（Transformer loop_p4_v2 gen 4）：1200 步 onecycle
+                    # 的 loss 在 step 300（lr 峰值处）就见底，之后单调回升 0.0255，
+                    # 而导出的 final 正是全程最差的点；候选因此比 base 弱 74.8 Elo。
+                    # 口径说明：rec["loss"] 是最近 log_every 个**优化步**的平均，
+                    # 覆盖 log_every×accum×batch 个样本（循环里 50×4×512≈10 万），
+                    # 比单步 loss 稳得多，可以拿来选点。
+                    if (validate is None and export.get("best")
+                            and export.get("select_best_by", "none") == "train"
+                            and "loss" in rec and float(rec["loss"]) < best):
+                        best = float(rec["loss"])
+                        self._export(model, step, export.get("best"))
+                        rec["best"], rec["improved"] = best, True
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     print(json.dumps(rec, ensure_ascii=False), flush=True)
@@ -342,7 +359,11 @@ class Trainer:
                     break
             if state == "completed":
                 self._export(model, step, export.get("final", "final.pt"))
-                if validate is None and export.get("best", "best.pt"):
+                # select_best_by=train 时 best 已在上面按 loss 选出；只有一步都没选出
+                # 来（极短训练 / 续跑紧贴结尾、整个区间没落到 log 点上）才退回复制 final，
+                # 免得调用方按 export.best 找不到文件。
+                if (validate is None and not math.isfinite(best)
+                        and export.get("best", "best.pt")):
                     self._export(model, step, export.get("best", "best.pt"))
         finally:
             for sig, h in prev.items():

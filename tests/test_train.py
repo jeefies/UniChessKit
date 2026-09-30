@@ -6,12 +6,20 @@
 - `save_every=0` / 步数到达时必须落盘，否则「跑完但没 latest.pt」；
 - SIGTERM：下一次日志点保存并返回 `state="stopped"`，`latest.pt` 存在；
 - `export.final` / `export.best`（无 validate 时）按配置写出；
+- `export.select_best_by="train"`（无 validate）时 best 落在**训练 loss 最低**的那一步，
+  而不是 final 的副本；默认 `"none"` 保持旧行为（best == final）；
+- `export.select_best_by="train"`（无 validate）时 best 落在**训练 loss 最低**的那一步，
+  而不是 final 的副本——`"none"` 时保持旧行为（best == final）；
 - accum>1 时 backward 的是 `loss/accum`（R iteration46 / T t20m 的口径），
   而日志里记录的是未除的 total（旧脚本 `.item()` 的记录口径）。
 
 学习率调度（``Kit.train.schedule``）的构建与参数体检由 ``TestSchedule`` 钉死，
 特别是两个手写调度的 ``warmup`` / 余弦窗口 **缺参数或 ≤ 0 时要有清楚报错**
 （loop 的变体会整体替换 ``schedule``，替换后少了 ``warmup`` 是真实场景）。
+
+``TestSelectBestByTrain`` 用的 ``VShapedLossTask`` 在 CE 之外叠一个以 step 为自变量的
+U 形偏置，loss 序列必然"先降后升"——1:1 复刻 loop_p4_v2 gen 4 的形状。只有这样
+"best = loss 最低点"与"best = final 副本"才分得开。
 """
 from __future__ import annotations
 
@@ -227,6 +235,124 @@ class TestTrainerLoop(unittest.TestCase):
         by_step = [seen[i * 4:(i + 1) * 4] for i in range(3)]
         for r, chunk in zip(recs, by_step):
             self.assertAlmostEqual(sum(chunk), r["loss"], places=4)
+
+
+class TestSelectBestByTrain(unittest.TestCase):
+    """无 validation 时 ``export.select_best_by`` 的两套口径。
+
+    2026-09-30 的真实事故（Transformer ``loop_p4_v2`` gen 4）：1200 步 onecycle 的
+    loss 在 step 300 就见底、之后单调回升 0.0255，而 ``export.final`` 只导最后一步
+    ——导出的正是全程最差的点，候选因此比 base 弱 74.8 Elo 判 H0。
+    ``select_best_by="train"`` 就是兜住"训过头"：best 落在 loss 最低那一步。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="p19tr_")
+        self.d = Path(self.tmp.name)
+        sys.modules.setdefault("tests.test_train", sys.modules[__name__])
+        setattr(sys.modules[__name__], "ToyTaskFactory", ToyTaskFactory)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cfg(self, out, *, export_extra, steps=40, log_every=1):
+        return make_config(out, steps=steps, log_every=log_every,
+                           export={"best": "best.pt", "final": "final.pt", **export_extra})
+
+    def _loss_seq(self, name="train"):
+        recs = _losses(self.d / name / "train.jsonl")
+        return recs, [r["loss"] for r in recs]
+
+    def test_best_falls_on_min_loss_step_not_final(self):
+        cfg = self._cfg(self.d / "train", export_extra={"select_best_by": "train"})
+        res = Trainer(cfg, VShapedLossTask(mid=20)).run()
+        self.assertEqual(res["state"], "completed")
+        recs, losses = self._loss_seq("train")
+        argmin = int(np.argmin(losses)) + 1                 # 1-based 步号
+        best = torch.load(self.d / "train" / "best.pt", weights_only=False)
+        final = torch.load(self.d / "train" / "final.pt", weights_only=False)
+        # 前提：argmin 必须严格落在中间，否则本测试什么都证明不了
+        self.assertLess(argmin, len(losses), "argmin 落在最后一步，测试失去意义")
+        self.assertEqual(best["step"], argmin, "best 应落在 loss 最低的那一步")
+        self.assertEqual(final["step"], len(losses))
+        self.assertNotEqual(best["step"], final["step"])
+        self.assertLess(min(losses), losses[-1], "终值应高于最低点")
+        # 只有 argmin 那一步记 improved，且 best 收敛到最小 loss
+        improved = [r for r in recs if r.get("improved")]
+        self.assertTrue(improved, "没有任何一步被记成 improved")
+        self.assertAlmostEqual(improved[-1]["best"], min(losses), places=9)
+        # 返回值的 best 变成训练 loss，不再是 Infinity
+        self.assertTrue(math.isfinite(res["best"]))
+        self.assertAlmostEqual(res["best"], min(losses), places=9)
+
+    def test_select_best_by_none_keeps_best_equals_final(self):
+        """默认 'none'：保持旧行为，best 就是 final 的副本。"""
+        cfg = self._cfg(self.d / "none", export_extra={})
+        res = Trainer(cfg, VShapedLossTask(mid=20)).run()
+        recs, losses = self._loss_seq("none")
+        best = torch.load(self.d / "none" / "best.pt", weights_only=False)
+        final = torch.load(self.d / "none" / "final.pt", weights_only=False)
+        self.assertEqual(best["step"], final["step"])
+        self.assertEqual(best["step"], len(recs))
+        self.assertEqual(res["best"], math.inf)
+        for k in final["model"]:
+            self.assertTrue(torch.equal(best["model"][k], final["model"][k]),
+                            f"'none' 口径下 best 应与 final 逐位相同：{k}")
+        # 同一份 V 形 loss，'none' 把最低点让给了 final
+        self.assertNotEqual(final["step"], int(np.argmin(losses)) + 1)
+
+    def test_select_best_by_rejects_unknown_value(self):
+        with self.assertRaises(ValueError) as cm:
+            self._cfg(self.d / "bad", export_extra={"select_best_by": "loss"})
+        self.assertIn("select_best_by", str(cm.exception))
+
+    def test_select_best_by_train_survives_resume(self):
+        """中断续跑后，best 仍应是全程 loss 最低点（best 随 latest.pt 传递）。"""
+        import threading
+
+        steps, cut = 24, 8
+        extra = {"select_best_by": "train"}
+        Trainer(self._cfg(self.d / "full", export_extra=extra, steps=steps),
+                VShapedLossTask(mid=12)).run()
+        recs_full, losses_full = self._loss_seq("full")
+        argmin_full = int(np.argmin(losses_full)) + 1
+
+        ev = threading.Event()
+        task = VShapedLossTask(mid=12, on_step=lambda s: ev.set() if s + 1 >= cut else None)
+        res1 = Trainer(self._cfg(self.d / "part", export_extra=extra, steps=steps),
+                       task, stop_event=ev).run()
+        self.assertEqual(res1["state"], "stopped")
+        self.assertLess(res1["step"], steps)
+        Trainer(self._cfg(self.d / "part", export_extra=extra, steps=steps),
+                VShapedLossTask(mid=12)).run()
+        recs_part, losses_part = self._loss_seq("part")
+        self.assertEqual(losses_part, losses_full, "续跑的 loss 序列应与一次跑完一致")
+        best = torch.load(self.d / "part" / "best.pt", weights_only=False)
+        self.assertEqual(best["step"], argmin_full,
+                         "续跑后 best 仍应是全程 loss 最低点")
+
+
+class VShapedLossTask(ToyTask):
+    """在 CE 之外叠加一个以 step 为自变量的 U 形偏置，loss 序列必然"先降后升"。
+
+    1:1 复刻 2026-09-30 loop_p4_v2 gen 4 的形状（loss 在 step 300 见底后单调回升）。
+    偏置项对参数梯度为 0，不改变训练本身，只把 argmin 钉在中间某一步——
+    这样"best = loss 最低点"和"best = final 副本"两种口径才能被真正区分。
+
+    ``on_step(step)`` 是钩子，测试用来在指定步请求停止（确定性中断，不依赖墙钟）。
+    """
+
+    def __init__(self, mid=None, depth=0.01, on_step=None, **kw):
+        super().__init__(**kw)
+        self.mid, self.depth, self.on_step = mid, depth, on_step
+
+    def loss(self, model, batch, step):
+        x, y = batch
+        if self.on_step is not None:
+            self.on_step(step)
+        ce = F.cross_entropy(model(x), y)
+        dip = self.depth * (step - self.mid) ** 2 if self.mid is not None else 0.0
+        return ce + dip, {"toy": 1.0}
 
 
 class TestSchedule(unittest.TestCase):
