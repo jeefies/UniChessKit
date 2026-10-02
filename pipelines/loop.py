@@ -488,6 +488,14 @@ class Loop:
         a["label"] = f"gen{g}"
         b = _subst(self.conf["engine"], m)
         b["label"] = "champion"
+        # 判决必须可复现：arena 两侧**强制确定性选着**（temperature=0）。
+        # ``engine.kwargs`` 是自对弈与 arena 共用的，自对弈可能需要
+        # temperature>0 来让对局有变化（否则 argmax(访问数) + ε=0 会让对局
+        # 塌缩成确定性树），但那不能渗进判决——否则同一局能下出不同结果，
+        # SPRT 的方差白涨。match 的 SearchBudget 默认 add_noise=False，
+        # 所以 Dirichlet 本来就不进 arena，只有 temperature 需要在这里挡掉。
+        for side in (a, b):
+            side["kwargs"]["temperature"] = 0
         path = gd / "arena.json"
         _write_json(path, {"a": a, "b": b, "match": self.conf["arena"]["match"]})
         self._run("match", path, gd / "arena.log", ("--out", str(gd / "arena.jsonl"), "--quiet"))

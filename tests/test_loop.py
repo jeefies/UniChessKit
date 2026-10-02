@@ -525,6 +525,68 @@ class TestPerGenerationSeeds(unittest.TestCase):
         self.assertEqual(rec["seeds"]["match"], loop._gen_seed(1, 3))
 
 
+class TestArenaDeterministicSelection(unittest.TestCase):
+    """arena 两侧必须确定性选着（temperature=0），不受自对弈配置影响。
+
+    动机（2026-10-02）：给自对弈加 ``temperature>0`` 让对局有变化时发现
+    ``engine.kwargs`` 是自对弈与 arena 共用的——不挡一手，自对弈的
+    temperature 会渗进 arena，同一局能下出不同结果，SPRT 方差白涨。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
+        self.loop = Loop(_conf(self.tmp, engine={
+            "factory": "No.such:factory",
+            "kwargs": {"checkpoint": "{weights}", "simulations": 800,
+                       "temperature": 2.0, "dirichlet_eps": 0.1,
+                       "root_min_visits": 4}}), self.tmp)
+
+    @staticmethod
+    def _fake_run(self, subcmd, cfg_path, log_path, extra=()):
+        """替掉子进程：只按需造一个假 summary，让 phase_arena 的返回路径走通。"""
+        gd = Path(cfg_path).parent
+        if subcmd == "match":
+            (gd / "arena.jsonl.summary.json").write_text(
+                json.dumps({"score_a": 0.5, "sprt": {"verdict": "H0"}}), encoding="utf-8")
+
+    def _write_arena(self, g=3):
+        gd = self.loop.gen_dir(g)
+        gd.mkdir(parents=True, exist_ok=True)
+        m = self.loop.mapping(g, "/w/champ.pt")
+        with mock.patch.object(Loop, "_run", self._fake_run):
+            self.loop.phase_arena(g, m)
+        return json.loads((gd / "arena.json").read_text(encoding="utf-8"))
+
+    def test_arena_forces_temperature_zero(self):
+        cfg = self._write_arena()
+        for side in ("a", "b"):
+            self.assertEqual(cfg[side]["kwargs"]["temperature"], 0,
+                             f"arena {side} 必须确定性选着")
+        # 其它搜索参数保持透传，不被顺手改掉
+        for side in ("a", "b"):
+            self.assertEqual(cfg[side]["kwargs"]["dirichlet_eps"], 0.1)
+            self.assertEqual(cfg[side]["kwargs"]["root_min_visits"], 4)
+            self.assertEqual(cfg[side]["kwargs"]["simulations"], 800)
+        # 双方权重必须不同（候选 vs 冠军）
+        self.assertNotEqual(cfg["a"]["kwargs"]["checkpoint"],
+                            cfg["b"]["kwargs"]["checkpoint"])
+        self.assertEqual(cfg["a"]["label"], "gen3")
+        self.assertEqual(cfg["b"]["label"], "champion")
+
+    def test_arena_without_temperature_still_zero(self):
+        """没配 temperature 时也显式为 0（不依赖默认值）。"""
+        loop = Loop(_conf(self.tmp), self.tmp)
+        loop.out.mkdir(parents=True, exist_ok=True)
+        gd = loop.gen_dir(1)
+        gd.mkdir(parents=True, exist_ok=True)
+        m = loop.mapping(1, "/w/champ.pt")
+        with mock.patch.object(Loop, "_run", self._fake_run):
+            loop.phase_arena(1, m)
+        cfg = json.loads((gd / "arena.json").read_text(encoding="utf-8"))
+        for side in ("a", "b"):
+            self.assertEqual(cfg[side]["kwargs"]["temperature"], 0)
+
+
 class TestPromote(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="kit_loop_"))
