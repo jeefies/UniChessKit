@@ -83,6 +83,16 @@ def mlh_target(x: torch.Tensor, wdl_target: torch.Tensor) -> torch.Tensor:
     return (2.0 * piece_counts + 20.0 * (1.0 - q_target)) / 100.0
 
 
+def anchor_kl(policy_logits: torch.Tensor, ref_probs: torch.Tensor) -> torch.Tensor:
+    """锚定正则 KL(π_ref ‖ π_θ)，ref 当常量（与 ``policy_loss_type="kl_divergence"`` 同向：
+    第二参数是被拟合的 target）。两路都先转 fp32——bf16 下 ``log`` 会把小概率压成 0。
+
+    用来把微调钉在基座策略附近（实验：drift 会让网络只贴自己的搜索分布、丢掉外部先验）。
+    """
+    return F.kl_div(F.log_softmax(policy_logits.float(), dim=-1), ref_probs.float(),
+                    reduction="batchmean", log_target=False)
+
+
 @dataclass
 class ChessLossOutput:
     total_loss: torch.Tensor

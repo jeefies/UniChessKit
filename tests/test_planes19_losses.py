@@ -221,5 +221,145 @@ class TestChessLoss(unittest.TestCase):
         self.assertEqual(L.ChessLoss().policy_loss_type, "cross_entropy")
 
 
+# ---------------------------------------------------------------- 锚定正则（anchor）
+
+class TinyAnchorNet(torch.nn.Module):
+    """损失接线测试用的小网：输出 (policy[4096], promo[4], wdl[3])。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(19 * 8 * 8, 16)
+        self.head_p = torch.nn.Linear(16, 4096)
+        self.head_pr = torch.nn.Linear(16, 4)
+        self.head_w = torch.nn.Linear(16, 3)
+
+    def forward(self, x, return_mlh=False):
+        h = torch.relu(self.fc(x.flatten(1)))
+        out = (self.head_p(h), self.head_pr(h), self.head_w(h))
+        if return_mlh:
+            return (*out, self.head_w(h))
+        return out
+
+
+class TinyAnchorAdapter:
+    def __init__(self, **_):
+        pass
+
+    def build(self):
+        return TinyAnchorNet()
+
+    def forward(self, model, x, bucket=None, *, mlh=False):
+        if bucket is not None:
+            raise ValueError("测试网没有分桶头")
+        return model(x, return_mlh=mlh)
+
+    def export(self, model, step):
+        return {"model": model.state_dict(), "step": step}
+
+
+def make_tiny_anchor_adapter(**kw):
+    return TinyAnchorAdapter(**kw)
+
+
+def anchor_batch(n=4, seed=0):
+    torch.manual_seed(seed)
+    x = torch.rand(n, 19, 8, 8)
+    p = torch.randint(1, 10, (n, 4096)).float()
+    p = p / p.sum(1, keepdim=True)
+    w = torch.tensor([0.6, 0.3, 0.1]).repeat(n, 1)
+    return (x, p, torch.full((n,), -100, dtype=torch.int64), w)
+
+
+def anchor_task(**loss_kw):
+    from Kit.planes19.task import Planes19Task
+    return Planes19Task(
+        model={"factory": "Kit.tests.test_planes19_losses:make_tiny_anchor_adapter",
+               "kwargs": {}},
+        data={"kind": "mix", "batch_size": 4, "seed": 0, "sources": []},
+        loss={"kind": "t_chess", **loss_kw})
+
+
+class TestAnchorKL(unittest.TestCase):
+    """``anchor_kl`` 的数学：同分布 → 0；已知分布 → 手算值；方向为 KL(ref‖θ)。"""
+
+    def test_zero_when_identical(self):
+        logits = torch.randn(5, 64)
+        p = torch.softmax(logits, dim=-1)
+        self.assertAlmostEqual(float(L.anchor_kl(logits, p)), 0.0, places=6)
+
+    def test_known_value_and_direction(self):
+        # ref = [0.5, 0.5, 0]，θ = [0.25, 0.75, 0]：KL(ref‖θ) = .5*ln(.5/.25)+.5*ln(.5/.75)
+        ref = torch.tensor([[0.5, 0.5, 0.0]])
+        logits = torch.log(torch.tensor([[0.25, 0.75, 1e-30]]))
+        want = 0.5 * np.log(0.5 / 0.25) + 0.5 * np.log(0.5 / 0.75)
+        self.assertAlmostEqual(float(L.anchor_kl(logits, ref)), float(want), places=5)
+
+    def test_gradient_pulls_theta_toward_ref(self):
+        ref = torch.tensor([[0.9, 0.1]])
+        logits = torch.tensor([[0.0, 0.0]], requires_grad=True)
+        loss = L.anchor_kl(logits, ref)
+        loss.backward()
+        grad = logits.grad
+        # ref 更支持类 0 → 类 0 的 logit 应被推高（负梯度）、类 1 被推低
+        self.assertLess(float(grad[0, 0]), 0.0)
+        self.assertGreater(float(grad[0, 1]), 0.0)
+
+
+class TestAnchorPlumbing(unittest.TestCase):
+    """``Planes19Task`` 的接线：默认无锚（零行为变化）；开了以后冻结、进 loss、不进优化器。"""
+
+    def test_disabled_by_default(self):
+        t = anchor_task()
+        self.assertEqual(t._anchor_weight, 0.0)
+        t.build_model()
+        self.assertIsNone(t._anchor)
+        with self.assertRaises(ValueError):
+            anchor_task(anchor_weight=-1e-3)
+
+    def test_enabled_anchor_is_frozen_copy(self):
+        torch.manual_seed(7)
+        t_ref = anchor_task()
+        m_plain = t_ref.build_model()
+        torch.manual_seed(7)
+        t = anchor_task(anchor_weight=0.5)
+        m = t.build_model()
+        self.assertIsNotNone(t._anchor)
+        self.assertFalse(any(p.requires_grad for p in t._anchor.parameters()))
+        # 同一个种子 → 锚与起点逐位相同
+        for k, v in m.state_dict().items():
+            self.assertTrue(torch.equal(v, t._anchor.state_dict()[k]), k)
+        # 锚不进 param_groups
+        ids = {id(p) for g in t.param_groups(m) for p in g["params"]}
+        self.assertFalse(any(id(p) in ids for p in t._anchor.parameters()))
+        # 锚不进 state_dict（续训检查点不该带它）
+        self.assertNotIn("_anchor", m.state_dict())
+
+    def test_anchor_term_enters_loss(self):
+        batch = anchor_batch()
+        torch.manual_seed(7)
+        t0 = anchor_task()
+        m_plain = t0.build_model()
+        loss0, parts0 = t0.loss(m_plain, batch, 0)
+        self.assertNotIn("anchor", parts0)
+        torch.manual_seed(7)
+        t1 = anchor_task(anchor_weight=0.5)
+        m1 = t1.build_model()
+        loss1, parts1 = t1.loss(m1, batch, 0)
+        self.assertIn("anchor", parts1)
+        # 锚 == 起点 → KL ≈ 0，总损失与无锚一致
+        self.assertAlmostEqual(float(parts1["anchor"].detach()), 0.0, places=6)
+        self.assertAlmostEqual(float(loss1.detach()), float(loss0.detach()), places=6)
+        # 动过学生：锚项 > 0；同一模型同一批上"开锚/关锚"之差必须恰好是 β·KL
+        with torch.no_grad():
+            m1.fc.weight.add_(0.3)
+        loss_plain, parts_plain = t0.loss(m1, batch, 0)
+        loss_anchor, parts_anchor = t1.loss(m1, batch, 0)
+        kl = float(parts_anchor["anchor"].detach())
+        self.assertGreater(kl, 0.0)
+        self.assertNotIn("anchor", parts_plain)
+        self.assertAlmostEqual(float(loss_anchor.detach()),
+                               float(loss_plain.detach()) + 0.5 * kl, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -36,7 +37,8 @@ from ..registry import load_object
 from ..train.data import resumable_loader
 from .dataset import (BatchShardDataset, CurriculumStream, Decoder, ShardSet, SpecialtyPool,
                       list_shards)
-from .losses import ChessLoss, legal_from_to_mask, mlh_target, r_iter_loss, r_stage1_loss
+from .losses import (ChessLoss, anchor_kl, legal_from_to_mask, mlh_target, r_iter_loss,
+                     r_stage1_loss)
 
 DATA_KINDS = ("loader", "pool", "curriculum", "mix")
 LOSS_KINDS = ("r_stage1", "r_iter", "t_chess")
@@ -83,7 +85,11 @@ class Planes19Task:
             raise ValueError(f"loss.kind 应为 {LOSS_KINDS}")
         _check_keys(self.loss_cfg, ("kind", "legal_mask", "check_leak", "value_weight",
                                     "promo_weight", "policy_weight", "wdl_weight", "mlh_weight",
-                                    "mlh", "policy_loss_type"), "loss")
+                                    "mlh", "policy_loss_type", "anchor_weight"), "loss")
+        self._anchor = None
+        self._anchor_weight = float(self.loss_cfg.get("anchor_weight", 0.0))
+        if self._anchor_weight < 0:
+            raise ValueError("loss.anchor_weight 不能为负")
         self.num_buckets = int(getattr(self.adapter, "num_buckets", 1))
         self.channels_last = bool(getattr(self.adapter, "channels_last", False))
         self.state: dict = {}
@@ -98,7 +104,17 @@ class Planes19Task:
 
     # ------------------------------------------------------------ TrainTask
     def build_model(self):
-        return self.adapter.build()
+        model = self.adapter.build()
+        if self._anchor_weight > 0:
+            # 锚 = 训练起点权重的冻结副本（deepcopy，故不依赖续训：续训时锚是"本次起点"）
+            self._anchor = copy.deepcopy(model).eval()
+            for p in self._anchor.parameters():
+                p.requires_grad_(False)
+        return model
+
+    def on_train_start(self, model, ctx):
+        if self._anchor is not None:
+            self._anchor.to(ctx.device).eval()
 
     def trainable(self, model):
         fn = getattr(self.adapter, "trainable", None)
@@ -268,6 +284,15 @@ class Planes19Task:
                                        mlh_logits=out[3], mlh_target=mlh_target(x, w_t))
             else:
                 res = self._chess_loss(out[0], out[1], out[2], p_t, pr_t, w_t)
+            if self._anchor is not None and self._anchor_weight > 0:
+                with torch.no_grad():
+                    ref = self.adapter.forward(self._anchor, x,
+                                               batch[4] if len(batch) > 4 else None)
+                    ref_p = F.softmax(ref[0].float(), dim=-1)
+                kl = anchor_kl(out[0], ref_p)
+                parts = dict(res.parts)
+                parts["anchor"] = kl
+                return res.total_loss + self._anchor_weight * kl, parts
             return res.total_loss, res.parts
         legal = legal_from_to_mask(x) if lc.get("legal_mask", kind == "r_stage1") else None
         if legal is not None and step == 0 and lc.get("check_leak", True):
