@@ -107,6 +107,18 @@ _SIGNATURES = {
     "kg_pi_prime": (ctypes.c_int, [_f32p, ctypes.c_int, _i64p, _f32p, ctypes.c_double,
                                    ctypes.c_double, ctypes.c_double, _f32p]),
     "kg_topm": (ctypes.c_int, [_f32p, ctypes.c_int, _f32p, ctypes.c_int, _intp]),
+    # Gumbel 顺序减半的搜索（树/调度；collect/apply 按拍批量）
+    "kg_ctx_new": (_c_void_p, [ctypes.c_double, ctypes.c_double, ctypes.c_int, ctypes.c_int]),
+    "kg_ctx_free": (None, [_c_void_p]),
+    "kg_set_root": (ctypes.c_int, [_c_void_p, _u64p, ctypes.c_int, ctypes.c_uint64, ctypes.c_int,
+                                   ctypes.c_int, _u16p, ctypes.c_int]),
+    "kg_expand_root": (ctypes.c_int, [_c_void_p, _f32p, _f32p, _f32p]),
+    "kg_begin": (ctypes.c_int, [_c_void_p, _f32p, ctypes.c_int]),
+    "kg_collect": (ctypes.c_int, [_c_void_p, ctypes.c_int, _f32p, _intp]),
+    "kg_apply": (ctypes.c_int, [_c_void_p, _f32p, _f32p, _f32p, ctypes.c_int]),
+    "kg_root_pi_prime": (ctypes.c_int, [_c_void_p, _f32p]),
+    "kg_encode_root": (ctypes.c_int, [_c_void_p, _f32p]),
+    "kg_root_export": (ctypes.c_int, [_c_void_p, _u16p, _f32p, _i64p, _f32p, _f64p]),
 }
 
 

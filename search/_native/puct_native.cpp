@@ -1359,3 +1359,454 @@ KP_API int kg_topm(const float* logits, int n, const float* noise, int m0, int* 
     return kg_topm_impl(logits, n, noise, m0, out);
     KP_CATCH(-2)
 }
+
+// ==================== Gumbel 顺序减半：搜索树 + 调度 ====================
+//
+// 与 ``Kit/search/gumbel.py`` 的 ``Gumbel`` / ``order_halving_gen`` 数值等价（非逐位，
+// 契约见上）。按拍（wave）批量：一轮里每个存活候选各下探一次 = 一拍；一拍的叶子一次
+// 交给 Python 前向（候选子树互不相交，批内顺序无关——与 Python parallel=True 的
+// gather 同语义）。
+//
+// 状态机：kg_set_root → kg_expand_root(根前向) → kg_begin(噪声) → 循环
+// [kg_collect 返回本拍需要前向的叶子数 → Python 前向 → kg_apply 回填] → 完成。
+// 收集期间不允许再 collect（必须先 apply）。
+
+namespace {
+
+// 与 gumbel.py 的 NEG_LOGIT 一致：非法/零先验的 ℓ 取有限大负数
+const float G_NEG_LOGIT = -3e4f;
+
+struct GNode;
+typedef std::shared_ptr<GNode> GNodeP;
+
+struct GNode {
+    std::vector<uint16_t> moves;
+    std::vector<float> logits, QSUM;
+    std::vector<int64_t> N;
+    std::vector<GNodeP> children;
+    std::vector<Hist> hist;   // 本局面之前的对局历史（根段 + 路径）
+    Pos pos;
+    double q = 0.0;           // 网络值 / 终局真值（均为行棋方视角）
+    bool expanded = false;
+    bool terminal = false;
+    int depth = 0;
+};
+
+struct Pending {
+    GNodeP node;                                    // 新展开的叶子
+    std::vector<std::pair<GNode*, int>> path;       // 根→叶子的每一步 (父节点, 边)
+};
+
+struct GCtx {
+    double c_visit = 50.0, c_scale = 0.1;
+    int m0 = 16;
+    bool claim_draw = true;
+    std::vector<Hist> root_hist;
+    Pos root_pos;
+    GNodeP root;
+    bool begun = false, finished = false, collecting = false;
+    std::vector<int> cand;                 // 存活候选（根的边序号）
+    std::vector<float> cand_noise;
+    std::vector<int> rounds_budget;
+    int round = 0, wave = 0;
+    std::vector<int> ks;
+    int sims_used = 0;
+    int action = -1;
+    std::vector<Pending> pending;
+    int n_nodes = 0, n_terminal = 0, max_depth = 0;
+};
+
+// 把 priors 变成 ℓ：np.log 后 clamp 到 NEG_LOGIT（与 node_from_eval 一致）
+void g_logits_of(const std::vector<float>& pri, std::vector<float>& out) {
+    out.resize(pri.size());
+    for (size_t i = 0; i < pri.size(); ++i)
+        out[i] = std::max(std::log(pri[i]), G_NEG_LOGIT);
+}
+
+void g_fill_expanded(GNode* n, const std::vector<Mv>& legal, const std::vector<float>& pri) {
+    size_t k = legal.size();
+    n->moves.resize(k);
+    for (size_t i = 0; i < k; ++i) n->moves[i] = mv_code(legal[i]);
+    g_logits_of(pri, n->logits);
+    n->N.assign(k, 0);
+    n->QSUM.assign(k, 0.0f);
+    n->children.assign(k, GNodeP());
+    n->expanded = true;
+}
+
+// 展开 parent 的第 edge 个孩子。需要前向时登记 pending 并返回 nullptr（path 已含本步）。
+GNodeP g_expand_child(GCtx& g, GNode* parent, int edge, float* planes, int& produced,
+                      std::vector<std::pair<GNode*, int>>& path) {
+    path.push_back({parent, edge});
+    Mv mv = mv_decode(parent->moves[(size_t)edge]);
+    Pos cp = push(parent->pos, mv);
+    std::vector<Hist> ch = parent->hist;
+    ch.push_back(Hist{key_of(parent->pos), irreversible(parent->pos, mv)});
+    std::vector<Mv> legal;
+    gen_legal(cp, legal);
+    GNodeP nn = std::make_shared<GNode>();
+    nn->pos = cp;
+    nn->hist = std::move(ch);
+    nn->depth = parent->depth + 1;
+    if (nn->depth > g.max_depth) g.max_depth = nn->depth;
+    double tv = 0.0;
+    if (rules_value(cp, nn->hist, nn->hist.size(), legal, g.claim_draw, &tv)) {
+        nn->terminal = true;
+        nn->expanded = true;
+        nn->q = tv;
+        parent->children[(size_t)edge] = nn;
+        g.n_nodes += 1;
+        g.n_terminal += 1;
+        return nn;
+    }
+    nn->moves.resize(legal.size());
+    for (size_t i = 0; i < legal.size(); ++i) nn->moves[i] = mv_code(legal[i]);
+    parent->children[(size_t)edge] = nn;
+    encode(cp, repetitions_of(cp, nn->hist, nn->hist.size()),
+           planes + (size_t)produced * PLANE_SIZE);
+    g.pending.push_back(Pending{nn, path});
+    produced += 1;
+    return nullptr;
+}
+
+// 非根下探（_simulate）：true = 有值（*out_val，node 视角）；false = 需要前向（pending 持有路径）
+bool g_sim_node(GCtx& g, GNode* node, double* out_val, float* planes, int& produced,
+                std::vector<std::pair<GNode*, int>>& path) {
+    if (node->terminal) {
+        *out_val = node->q;
+        return true;
+    }
+    int a = -1;
+    if (kg_select_action_impl(node->logits.data(), (int)node->moves.size(), node->N.data(),
+                              node->QSUM.data(), node->q, g.c_visit, g.c_scale, &a) != 0)
+        throw std::runtime_error("kg_select_action 失败");
+    GNode* child = node->children[(size_t)a].get();
+    double val;
+    if (child == nullptr) {
+        GNodeP nn = g_expand_child(g, node, a, planes, produced, path);
+        if (!nn) return false;
+        val = -nn->q;
+    } else {
+        path.push_back({node, a});
+        double sub = 0.0;
+        if (!g_sim_node(g, child, &sub, planes, produced, path)) return false;
+        val = -sub;
+    }
+    node->N[(size_t)a] += 1;
+    node->QSUM[(size_t)a] += (float)val;
+    return true;
+}
+
+// 根的候选下探（_sim_root）：用候选动作 a（不走 select_action）
+bool g_sim_root(GCtx& g, int a, float* planes, int& produced) {
+    GNode* root = g.root.get();
+    std::vector<std::pair<GNode*, int>> path;
+    GNode* child = root->children[(size_t)a].get();
+    double val;
+    if (child == nullptr) {
+        GNodeP nn = g_expand_child(g, root, a, planes, produced, path);
+        if (!nn) return false;
+        val = -nn->q;
+    } else if (child->terminal) {
+        path.push_back({root, a});
+        val = -child->q;
+    } else {
+        path.push_back({root, a});
+        double sub = 0.0;
+        if (!g_sim_node(g, child, &sub, planes, produced, path)) return false;
+        val = -sub;
+    }
+    root->N[(size_t)a] += 1;
+    root->QSUM[(size_t)a] += (float)val;
+    return true;
+}
+
+// pending 回填后的备份：沿路径自底向上交替取负（与 _simulate 的每层取负一致）
+void g_backup_path(const std::vector<std::pair<GNode*, int>>& path, double leaf_q) {
+    double v = leaf_q;
+    for (int i = (int)path.size() - 1; i >= 0; --i) {
+        GNode* nd = path[(size_t)i].first;
+        int e = path[(size_t)i].second;
+        const double rec = -v;
+        nd->N[e] += 1;
+        nd->QSUM[e] += (float)rec;
+        v = rec;
+    }
+}
+
+int g_n_rounds(int m) {
+    if (m >= 2) {
+        int r = 1;
+        while ((1 << r) < m) r += 1;
+        return r;
+    }
+    return 1;
+}
+
+void g_set_ks(GCtx& g, int budget) {
+    int k = (int)g.cand.size();
+    int base = budget / k, rem = budget % k;
+    g.ks.assign((size_t)k, base);
+    for (int i = 0; i < rem; ++i) g.ks[(size_t)i] += 1;
+}
+
+}  // namespace
+
+KP_API void* kg_ctx_new(double c_visit, double c_scale, int m0, int claim_draw) {
+    KP_TRY
+    GCtx* g = new GCtx();
+    g->c_visit = c_visit;
+    g->c_scale = c_scale;
+    g->m0 = m0;
+    g->claim_draw = claim_draw != 0;
+    return g;
+    KP_CATCH(nullptr)
+}
+
+KP_API void kg_ctx_free(void* ctx) { delete (GCtx*)ctx; }
+
+// 与 kp_set_root 同口径；返回根局面的合法着法数
+KP_API int kg_set_root(void* ctx, const uint64_t* bbs, int turn, uint64_t castling, int ep,
+                       int hmc, const uint16_t* moves, int n_moves) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    Pos p;
+    std::memset(&p, 0, sizeof(p));
+    for (int t = PAWN; t <= KING; ++t) p.bb[t] = bbs[t - 1];
+    p.co[WHITE] = bbs[6];
+    p.co[BLACK] = bbs[7];
+    p.turn = turn ? WHITE : BLACK;
+    p.castling = clean_castling(p, castling);
+    p.ep = ep;
+    p.hmc = hmc;
+    g.root_hist.clear();
+    std::vector<Mv> legal;
+    for (int i = 0; i < n_moves; ++i) {
+        Mv m = mv_decode(moves[i]);
+        gen_legal(p, legal);
+        bool ok = false;
+        for (const Mv& x : legal)
+            if (x.from == m.from && x.to == m.to && x.promo == m.promo) ok = true;
+        if (!ok) {
+            g_err = "对局历史第 " + std::to_string(i) + " 步不是合法着法";
+            return -2;
+        }
+        g.root_hist.push_back(Hist{key_of(p), irreversible(p, m)});
+        p = push(p, m);
+    }
+    g.root_pos = p;
+    gen_legal(g.root_pos, legal);
+    return (int)legal.size();
+    KP_CATCH(-2)
+}
+
+// 根展开（前向已在 Python 侧做完）：返回合法着法数
+KP_API int kg_expand_root(void* ctx, const float* policy, const float* promo, const float* wdl) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    std::vector<Mv> legal;
+    gen_legal(g.root_pos, legal);
+    GNodeP r = std::make_shared<GNode>();
+    r->pos = g.root_pos;
+    r->hist = g.root_hist;
+    r->depth = 0;
+    r->q = (double)wdl[0] - (double)wdl[2];
+    std::vector<float> pri;
+    priors_of(g.root_pos, legal, policy, promo, pri);
+    g_fill_expanded(r.get(), legal, pri);
+    g.root = r;
+    return (int)legal.size();
+    KP_CATCH(-2)
+}
+
+// noise 由 Python 采样（长度 = 根着法数）；g 已在 Python 侧乘进 noise
+KP_API int kg_begin(void* ctx, const float* noise, int n_sims) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    const int n = (int)g.root->moves.size();
+    std::vector<Mv> legal;
+    gen_legal(g.root_pos, legal);
+    double tv = 0.0;
+    if (n == 0 || rules_value(g.root_pos, g.root_hist, g.root_hist.size(), legal,
+                              g.claim_draw, &tv)) {
+        g.begun = true;
+        g.finished = true;
+        g.action = -1;
+        return 0;
+    }
+    std::vector<int> top((size_t)std::min(g.m0, n));
+    kg_topm_impl(g.root->logits.data(), n, noise, g.m0, top.data());
+    g.cand.assign(top.begin(), top.end());
+    g.cand_noise.resize(g.cand.size());
+    for (size_t i = 0; i < g.cand.size(); ++i) g.cand_noise[i] = noise[g.cand[i]];
+    const int rounds = g_n_rounds((int)g.cand.size());
+    int base = n_sims / rounds, rem = n_sims % rounds;
+    g.rounds_budget.assign((size_t)rounds, base);
+    for (int i = 0; i < rem; ++i) g.rounds_budget[(size_t)i] += 1;
+    g.round = 0;
+    g.wave = 0;
+    g.sims_used = 0;
+    {
+        int budget = g.rounds_budget[0];
+        if (g.cand.size() == 1) {
+            budget = 0;
+            for (int r2 = 0; r2 < rounds; ++r2) budget += g.rounds_budget[(size_t)r2];
+        }
+        g_set_ks(g, budget);
+    }
+    g.begun = true;
+    return rounds;
+    KP_CATCH(-2)
+}
+
+// 收集本拍需要前向的叶子；返回叶数（0 = 搜索完成）。info: [n_nodes,n_terminal,max_depth,
+// sims_used,rounds,action]
+KP_API int kg_collect(void* ctx, int cap, float* planes, int* info) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    if (!g.begun) throw std::runtime_error("kg_begin 尚未调用");
+    if (g.collecting) throw std::runtime_error("上一拍尚未 kg_apply");
+    auto fill = [&]() {
+        info[0] = g.n_nodes;
+        info[1] = g.n_terminal;
+        info[2] = g.max_depth;
+        info[3] = g.sims_used;
+        info[4] = (int)g.rounds_budget.size();
+        info[5] = g.action;
+    };
+    if (g.finished) {
+        fill();
+        return 0;
+    }
+    for (;;) {
+        int maxk = 0;
+        for (int k : g.ks) maxk = std::max(maxk, k);
+        while (g.wave < maxk) {
+            const int j = g.wave;
+            int need = 0;
+            for (size_t i = 0; i < g.cand.size(); ++i)
+                if (j < g.ks[i]) need += 1;
+            if (need > cap) throw std::runtime_error("kg_collect: cap 太小");
+            int produced = 0;
+            for (size_t i = 0; i < g.cand.size(); ++i) {
+                if (j >= g.ks[i]) continue;
+                g_sim_root(g, g.cand[i], planes, produced);   // 完成则已记录；pending 推迟到 apply
+            }
+            g.wave += 1;
+            if (produced > 0) {
+                g.collecting = true;
+                fill();
+                return produced;
+            }
+        }
+        // 轮末：重打分（候选 = (g·noise) + ℓ + σ(completedQ)，float64 相加后稳定降序取半）
+        {
+            const int n = (int)g.root->moves.size();
+            std::vector<float> pi((size_t)n), s((size_t)n);
+            kg_softmax_into(g.root->logits.data(), n, pi.data());
+            kg_qtransform(pi.data(), g.root->N.data(), g.root->QSUM.data(), n, g.root->q,
+                          g.c_visit, g.c_scale, s.data());
+            std::vector<std::pair<double, int>> scored;
+            scored.reserve(g.cand.size());
+            for (size_t i = 0; i < g.cand.size(); ++i) {
+                const int a = g.cand[i];
+                const double sc = (double)g.cand_noise[i] + (double)g.root->logits[(size_t)a]
+                                  + (double)s[(size_t)a];
+                scored.push_back({sc, (int)i});
+            }
+            std::stable_sort(scored.begin(), scored.end(),
+                             [](const std::pair<double, int>& x, const std::pair<double, int>& y) {
+                                 return x.first > y.first;
+                             });
+            const size_t keep = (size_t)std::max<size_t>(1, (g.cand.size() + 1) / 2);
+            std::vector<int> nc;
+            std::vector<float> nn2;
+            for (size_t i = 0; i < keep; ++i) {
+                nc.push_back(g.cand[(size_t)scored[i].second]);
+                nn2.push_back(g.cand_noise[(size_t)scored[i].second]);
+            }
+            g.cand.swap(nc);
+            g.cand_noise.swap(nn2);
+        }
+        g.sims_used += [&]() { int s2 = 0; for (int k : g.ks) s2 += k; return s2; }();
+        g.round += 1;
+        if (g.round >= (int)g.rounds_budget.size()) {
+            g.finished = true;
+            g.action = g.cand[0];
+            fill();
+            return 0;
+        }
+        int budget = g.rounds_budget[(size_t)g.round];
+        if (g.cand.size() == 1) {
+            budget = 0;
+            for (int r2 = g.round; r2 < (int)g.rounds_budget.size(); ++r2)
+                budget += g.rounds_budget[(size_t)r2];
+        }
+        g_set_ks(g, budget);
+        g.wave = 0;
+    }
+    KP_CATCH(-2)
+}
+
+// 回填本拍的前向结果：policy/promo 是概率（与 kp_apply 同口径），n = 叶数
+KP_API int kg_apply(void* ctx, const float* policy, const float* promo, const float* wdl, int n) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    if (!g.collecting) throw std::runtime_error("没有待回填的收集");
+    if (n != (int)g.pending.size())
+        throw std::runtime_error("kg_apply: 批大小与待回填叶子数不符");
+    for (int i = 0; i < n; ++i) {
+        Pending& p = g.pending[(size_t)i];
+        std::vector<Mv> legal;
+        for (uint16_t c : p.node->moves) legal.push_back(mv_decode(c));
+        std::vector<float> pri;
+        priors_of(p.node->pos, legal, policy + (size_t)i * 4096,
+                  promo + (size_t)i * 4, pri);
+        g_fill_expanded(p.node.get(), legal, pri);
+        p.node->q = (double)wdl[(size_t)i * 3] - (double)wdl[(size_t)i * 3 + 2];
+        g.n_nodes += 1;
+        if (p.node->depth > g.max_depth) g.max_depth = p.node->depth;
+        g_backup_path(p.path, p.node->q);
+    }
+    g.pending.clear();
+    g.collecting = false;
+    return 0;
+    KP_CATCH(-2)
+}
+
+// 根 π′（长度 = 根着法数）
+KP_API int kg_root_pi_prime(void* ctx, float* out) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    const int n = (int)g.root->moves.size();
+    if (n <= 0) throw std::runtime_error("kg_root_pi_prime: 根无着法");
+    kg_pi_prime_impl(g.root->logits.data(), n, g.root->N.data(), g.root->QSUM.data(),
+                     g.root->q, g.c_visit, g.c_scale, out);
+    return 0;
+    KP_CATCH(-2)
+}
+
+KP_API int kg_encode_root(void* ctx, float* out) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    encode(g.root_pos, repetitions_of(g.root_pos, g.root_hist, g.root_hist.size()), out);
+    return 0;
+    KP_CATCH(-2)
+}
+
+// 导出根的着法/ℓ/N/QSUM/q（Python 侧重建 Node 供 π′ 与测试用）；返回着法数
+KP_API int kg_root_export(void* ctx, uint16_t* moves, float* logits, int64_t* N, float* QSUM,
+                          double* q) {
+    KP_TRY
+    GCtx& g = *(GCtx*)ctx;
+    const int n = (int)g.root->moves.size();
+    for (int i = 0; i < n; ++i) {
+        if (moves) moves[i] = g.root->moves[(size_t)i];
+        if (logits) logits[i] = g.root->logits[(size_t)i];
+        if (N) N[i] = g.root->N[(size_t)i];
+        if (QSUM) QSUM[i] = g.root->QSUM[(size_t)i];
+    }
+    if (q) *q = g.root->q;
+    return n;
+    KP_CATCH(-2)
+}
