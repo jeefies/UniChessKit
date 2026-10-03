@@ -25,6 +25,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -50,11 +52,13 @@ class SelfPlayConfig:
     book_plies: int = 6
     simulations: Optional[int] = None   # 覆盖 Player 默认模拟数
     first_game: int = 0                 # 全局局序号起点（多进程分片：各进程取不相交区间）
+    workers: int = 1                    # 多进程分片：每 worker 一个进程 + 一个独立分片（.w{i}.sp.bin）
 
     def __post_init__(self):
         if (self.games < 0 or self.max_plies < 1 or self.concurrency < 1 or self.book_plies < 0
-                or self.first_game < 0):
-            raise ValueError("games / book_plies / first_game >= 0，max_plies / concurrency >= 1")
+                or self.first_game < 0 or self.workers < 1):
+            raise ValueError("games / book_plies / first_game >= 0，max_plies / concurrency / "
+                             "workers >= 1")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -190,6 +194,7 @@ def run_selfplay_config(conf: dict, should_stop: Optional[Callable[[], bool]] = 
     """``{"engine": EngineSpec, "selfplay": SelfPlayConfig, "sink": {"factory", "kwargs"}}``。
 
     sink 工厂返回带 ``on_game_end`` 的对象；若它有 ``done_games()``，已落盘的局跳过（续跑）。
+    ``selfplay.workers > 1`` 时走多进程分片（见 ``run_selfplay_workers``）。
     """
     from ..registry import EngineSpec, build_player_factory, load_object
 
@@ -198,6 +203,8 @@ def run_selfplay_config(conf: dict, should_stop: Optional[Callable[[], bool]] = 
         raise ValueError(f"自对弈配置有未知字段 {sorted(unknown)}")
     spec = EngineSpec.from_dict(conf["engine"])
     cfg = SelfPlayConfig(**conf["selfplay"])
+    if cfg.workers > 1:
+        return run_selfplay_workers(conf, cfg, spec, should_stop=should_stop)
     sink_conf = conf["sink"]
     sink = load_object(sink_conf["factory"], spec.root)(**sink_conf.get("kwargs", {}))
     done = sink.done_games() if hasattr(sink, "done_games") else set()
@@ -210,16 +217,111 @@ def run_selfplay_config(conf: dict, should_stop: Optional[Callable[[], bool]] = 
     return summary
 
 
+def _worker_sink_path(path: Path, i: int) -> Path:
+    """``selfplay.sp.bin`` -> ``selfplay.w{i}.sp.bin``（结尾仍是 .sp.bin，
+    loop 的 ``{selfplay_files}`` 用 ``*.sp.bin`` glob 收分片）。"""
+    return path.with_name(path.name[:-len(".sp.bin")] + f".w{i}.sp.bin")
+
+
+def run_selfplay_workers(conf: dict, cfg: SelfPlayConfig, spec,
+                         should_stop: Optional[Callable[[], bool]] = None) -> dict:
+    """多进程自对弈：``games`` 按**连续区间**切给 workers 个子进程，各自写 ``.w{i}.sp.bin``。
+
+    区间连续 ⇒ 全局局号不变 ⇒ 每局种子/开局与单进程一致（只有批组成差异，见模块说明）。
+    续跑按各分片自己的 ``done_games`` 跳过。⚠ **改 workers 数量会让旧分片与新区间错位**
+    （不同分片出现同一局号）——数量变了必须先归档旧分片再跑。
+
+    父进程是"工头"：起子进程、收各自 summary、聚合返回；收到 SIGTERM 时先杀子进程再退。
+    """
+    import signal
+    import subprocess
+
+    path = Path(dict(conf["sink"].get("kwargs", {}))["path"])
+    base, rem = divmod(cfg.games, cfg.workers)
+    procs = []
+    start = cfg.first_game
+    try:
+        for i in range(cfg.workers):
+            n = base + (1 if i < rem else 0)
+            if n == 0:
+                continue
+            w = dict(conf)
+            wsink = dict(conf["sink"])
+            wsk = dict(wsink.get("kwargs", {}))
+            wsk["path"] = str(_worker_sink_path(path, i))
+            wsink["kwargs"] = wsk
+            w["sink"] = wsink
+            wcfg = dict(cfg.to_dict())
+            wcfg.update(games=n, first_game=start, workers=1)
+            w["selfplay"] = wcfg
+            cpath = path.parent / f"{path.stem}.w{i}.json"
+            cpath.parent.mkdir(parents=True, exist_ok=True)
+            cpath.write_text(json.dumps(w, ensure_ascii=False, indent=1), encoding="utf-8")
+            sfile = path.parent / f"{path.stem}.w{i}.summary.json"
+            log = path.parent / f"{path.stem}.w{i}.log"
+            fh = open(log, "w", encoding="utf-8")
+            fh.write(f"$ {' '.join([sys.executable, '-m', 'Kit', 'selfplay', str(cpath)])}\n")
+            fh.flush()
+            p = subprocess.Popen(
+                [sys.executable, "-m", "Kit", "selfplay", str(cpath),
+                 "--summary-out", str(sfile)],
+                cwd=str(spec.root), stdout=fh, stderr=subprocess.STDOUT, env=dict(os.environ))
+            procs.append((i, p, fh, sfile, log, str(cpath)))
+            start += n
+
+        def _kill_children(*_a):
+            for _i, p2, _fh, _s, _l, _c in procs:
+                if p2.poll() is None:
+                    p2.terminate()
+            raise SystemExit(143)
+
+        prev = signal.signal(signal.SIGTERM, _kill_children)
+        try:
+            summaries = []
+            for i, p, fh, sfile, log, cpath in procs:
+                rc = p.wait()
+                fh.close()
+                if rc != 0:
+                    for _i2, p2, _fh2, _s2, _l2, _c2 in procs:
+                        if p2.poll() is None:
+                            p2.terminate()
+                    raise RuntimeError(f"selfplay worker {i} 退出码 {rc}"
+                                       f"（配置 {cpath}，日志 {log}）")
+                summaries.append(json.loads(sfile.read_text(encoding="utf-8")))
+        finally:
+            signal.signal(signal.SIGTERM, prev)
+    finally:
+        for _i, p, fh, _s, _l, _c in procs:
+            if p.poll() is None:
+                p.terminate()
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    total = {"games": 0, "plies": 0, "book_plies": 0, "termination": {},
+             "skipped_done": 0, "workers": len(procs)}
+    for s in summaries:
+        for k in ("games", "plies", "book_plies", "skipped_done"):
+            total[k] += int(s.get(k, 0))
+        for term, cnt in (s.get("termination") or {}).items():
+            total["termination"][term] = total["termination"].get(term, 0) + int(cnt)
+    return total
+
+
 def main(argv=None) -> int:
     import argparse
-    import json
 
     ap = argparse.ArgumentParser(description="UniChessKit 自对弈")
     ap.add_argument("config", help="JSON：{\"engine\": EngineSpec, \"selfplay\": {...}, \"sink\": {...}}")
+    ap.add_argument("--summary-out", default=None, help="汇总 JSON 另写到该文件（多进程 worker 用）")
     args = ap.parse_args(argv)
     conf = json.loads(Path(args.config).read_text(encoding="utf-8"))
     summary = run_selfplay_config(conf)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    text = json.dumps(summary, ensure_ascii=False, indent=2)
+    if args.summary_out:
+        Path(args.summary_out).write_text(text, encoding="utf-8")
+    print(text)
     return 0
 
 
