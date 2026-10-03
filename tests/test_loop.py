@@ -571,6 +571,25 @@ class TestArenaDeterministicSelection(unittest.TestCase):
         self.assertNotEqual(cfg["a"]["kwargs"]["checkpoint"],
                             cfg["b"]["kwargs"]["checkpoint"])
         self.assertEqual(cfg["a"]["label"], "gen3")
+        # PUCT 工厂不认 g，不能顺手塞进去
+        for side in ("a", "b"):
+            self.assertNotIn("g", cfg[side]["kwargs"])
+
+    def test_arena_forces_gumbel_g_zero(self):
+        """Gumbel 工厂的随机性来自根噪声 g：arena 必须 g=0（与 temperature 同理）。"""
+        loop = Loop(_conf(self.tmp, engine={
+            "factory": "Transformer.kit:make_gumbel_player_factory",
+            "kwargs": {"checkpoint": "{weights}", "simulations": 800, "g": 1.0,
+                       "m0": 16}}), self.tmp)
+        gd = loop.gen_dir(3)
+        gd.mkdir(parents=True, exist_ok=True)
+        m = loop.mapping(3, "/w/champ.pt")
+        with mock.patch.object(Loop, "_run", self._fake_run):
+            loop.phase_arena(3, m)
+        cfg = json.loads((gd / "arena.json").read_text(encoding="utf-8"))
+        for side in ("a", "b"):
+            self.assertEqual(cfg[side]["kwargs"]["g"], 0, f"arena {side} 必须 g=0")
+        self.assertEqual(cfg["a"]["kwargs"]["m0"], 16)      # 其它参数不被顺手改掉
         self.assertEqual(cfg["b"]["label"], "champion")
 
     def test_arena_without_temperature_still_zero(self):

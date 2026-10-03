@@ -496,6 +496,10 @@ class Loop:
         # 所以 Dirichlet 本来就不进 arena，只有 temperature 需要在这里挡掉。
         for side in (a, b):
             side["kwargs"]["temperature"] = 0
+            # Gumbel 工厂的随机性来自根噪声 g（GumbelPlayer 走含噪的减半幸存着），
+            # 同样不能渗进判决；只对 Gumbel 工厂设 g（PUCT 工厂不认这个键，会 TypeError）。
+            if "gumbel" in str(side.get("factory", "")):
+                side["kwargs"]["g"] = 0
         path = gd / "arena.json"
         _write_json(path, {"a": a, "b": b, "match": self.conf["arena"]["match"]})
         self._run("match", path, gd / "arena.log", ("--out", str(gd / "arena.jsonl"), "--quiet"))
