@@ -218,6 +218,41 @@ class TestGumbelCppSearchParity(unittest.TestCase):
         self.assertIsNone(a.move)
         self.assertIsNone(b.move)
 
+    def test_ctx_reuse_matches_fresh(self):
+        """同一个 GumbelCpp 连续搜两次（Player 每步一次的用法）必须与各自新建 ctx 相同。
+
+        2026-10-03 的真 bug：kg_begin 没复位 finished/action/sims_used，第二次搜索
+        会直接返回上一次的状态（sims=0、着法是旧的）。
+        """
+        from Kit.planes19 import BatchFnEvaluator
+        from Kit.runtime import run_sync
+        from Kit.search.gumbel import GumbelConfig
+        from Kit.search.gumbel_cpp import GumbelCpp
+        from Kit.testing import FakePlanes19Model
+
+        fake = FakePlanes19Model(salt="gcpp2")
+        cfg = GumbelConfig(simulations=32, m0=8, g=1.0)
+        board = chess.Board()
+
+        def run(engine, rng):
+            return run_sync(engine.search(board, rng=rng, simulations=32))
+
+        shared = GumbelCpp(BatchFnEvaluator("fk:s", fake.evaluate_planes), cfg)
+        u = np.random.default_rng(3).random(len(list(board.legal_moves))).astype(np.float32)
+
+        class _R:
+            def random(self, n, dtype=None):
+                return u
+
+        first = run(shared, _R())
+        second = run(shared, _R())
+        fresh = GumbelCpp(BatchFnEvaluator("fk:f", fake.evaluate_planes), cfg)
+        ref = run(fresh, _R())
+        self.assertEqual(second.stats["sims_used"], 32)
+        self.assertEqual(second.move, ref.move)
+        self.assertEqual(second.stats["sims_used"], ref.stats["sims_used"])
+        self.assertEqual(second.stats["n_nodes"], ref.stats["n_nodes"])
+
 
 if __name__ == "__main__":
     unittest.main()

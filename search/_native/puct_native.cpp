@@ -1623,6 +1623,23 @@ KP_API int kg_expand_root(void* ctx, const float* policy, const float* promo, co
 KP_API int kg_begin(void* ctx, const float* noise, int n_sims) {
     KP_TRY
     GCtx& g = *(GCtx*)ctx;
+    // 同一个 ctx 可连续多次搜索（Player 每步一次）：这里必须整体复位，
+    // 否则上一次的 finished/action/sims_used 会被当成这一次的结果返回。
+    g.begun = true;
+    g.finished = false;
+    g.collecting = false;
+    g.pending.clear();
+    g.sims_used = 0;
+    g.round = 0;
+    g.wave = 0;
+    g.ks.clear();
+    g.cand.clear();
+    g.cand_noise.clear();
+    g.rounds_budget.clear();
+    g.n_nodes = 0;
+    g.n_terminal = 0;
+    g.max_depth = 0;
+    g.action = -1;
     const int n = (int)g.root->moves.size();
     std::vector<Mv> legal;
     gen_legal(g.root_pos, legal);
