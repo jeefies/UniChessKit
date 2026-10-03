@@ -78,10 +78,14 @@ class GumbelPlayer:
         mv = res.move
         temp = self.temperature if budget.temperature is None else budget.temperature
         if temp > 0 and probs.size:
-            p = np.power(probs, 1.0 / float(temp), dtype=np.float32)
+            # π′ 采样：fp64 里做幂与归一，最后再除一次实际和（抹掉舍入残差——
+            # numpy 的 choice 对概率和的容差是 fp64 级，fp32 归一化会被拒）。
+            p = np.power(probs.astype(np.float64), 1.0 / float(temp))
             total = float(p.sum())
             if total > 0:
-                mv = moves[int(self.rng.choice(len(moves), p=(p / total).astype(np.float64)))]
+                p = p / total
+                p = p / float(p.sum())
+                mv = moves[int(self.rng.choice(len(moves), p=p))]
         if self.avoid_repetition:
             mv = self._avoid_repetition(board, mv, moves, res.root)
         if self._ply < self._book_len:               # 开局库：走库着，但 π′ 已由搜索产出

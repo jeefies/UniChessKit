@@ -42,6 +42,14 @@ class TestGumbelPlayer(unittest.TestCase):
         b = [d.move.uci() for d in self._play(g=0.0)]
         self.assertEqual(a, b)
 
+    def test_pi_prime_sampling_runs(self):
+        """temperature>0 = 从 π′ 采样（loop 自对弈口径）；概率和必须过 numpy 的严格检查。"""
+        for seed in (1, 2):
+            decs = self._play(temperature=1.0, plies=5, seed=seed)
+            self.assertEqual(len(decs), 5)
+            for dec in decs:
+                self.assertEqual(dec.info["sims"], 16)
+
     def test_clear_best_move_played(self):
         """一步杀：g=0 时假模型也许看不出来，但任何局面下都必须走合法着且 info 有 q。"""
         decs = self._play(plies=4)
