@@ -38,11 +38,16 @@ import contextlib
 import inspect
 import json
 import math
+import os
 import signal
 import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator, Optional, Protocol, runtime_checkable
+
+# 16 GB 卡上训练显存的大头是激活（microbatch 512），caching allocator 的碎片能到 1–2 GB。
+# expandable_segments 只改分配器行为、不影响任何数值；放在 torch 之前（CUDA 首次分配前读到）。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
