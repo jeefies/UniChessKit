@@ -1177,3 +1177,185 @@ KP_API int kp_root_fen(void* ctx, char* out, int cap) {
 // 对 float32 数组做 numpy 口径的 pairwise 求和（测试钩子）
 KP_API float kp_pairwise_f32(const float* a, int n) { return pairwise_sum(a, (size_t)n); }
 KP_API double kp_pairwise_f64(const double* a, int n) { return pairwise_sum(a, (size_t)n); }
+
+// ==================== Gumbel 顺序减半：节点级算术 ====================
+//
+// 契约：与 ``Kit/search/gumbel.py`` 的对应函数**数值等价**（非逐位一致）——
+// numpy 的 fp32 exp 与 BLAS dot 跟 libm / 手写累加有 1 ULP 级差异，因此：
+//   - ``kg_select_action`` 与 Python ``select_action`` 的决策一致率须 ≥ 99.9%
+//     （只在近-平局处允许不同）；``kg_pi_prime`` 的 max|Δ| ≤ 1e-5。
+// 对照 battery：tests/test_gumbel_cpp.py。
+//
+// 宽度/次序按 numpy 2.x（NEP 50）抄写：Python float 是弱标量，与 fp32 数组/标量运算
+// 保持 fp32；``N`` 是 int64，凡与它混合处都显式 ``(float)`` 转换以复刻
+// ``n.astype(np.float32)``。根 Gumbel 噪声由 Python 采样（``rng.random(dtype=fp32)`` →
+// ``-log(-log(u+1e-20))``），C++ 只消费给定数组 —— 不移植 PCG64。
+
+namespace {
+
+// numpy softmax：max 在 fp32、exp 在 fp32、和用 float64 pairwise、除法 fp32
+void kg_softmax_into(const float* x, int n, float* out) {
+    float mx = x[0];
+    for (int i = 1; i < n; ++i)
+        if (x[i] > mx) mx = x[i];
+    std::vector<double> acc((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        out[i] = std::exp(x[i] - mx);
+        acc[(size_t)i] = (double)out[i];
+    }
+    const float fs = (float)pairwise_sum(acc.data(), (size_t)n);
+    for (int i = 0; i < n; ++i) out[i] = out[i] / fs;
+}
+
+// v_mix（gumbel.py:132）：pi 必须是 softmax(logits) 的同一份数值
+double kg_vmix(const float* pi, const int64_t* N, const float* QSUM, int n, double q) {
+    int64_t n_tot = 0;
+    for (int i = 0; i < n; ++i) n_tot += N[i];
+    if (n <= 0 || n_tot == 0) return q;
+    std::vector<float> pv, qv;
+    for (int i = 0; i < n; ++i) {
+        if (N[i] > 0) {
+            pv.push_back(pi[i]);
+            qv.push_back(QSUM[i] / (float)N[i]);
+        }
+    }
+    double num = 0.0;  // np.dot(pv, qv)：BLAS 求和顺序不可复刻，用 fp64 累加近似
+    for (size_t i = 0; i < pv.size(); ++i) num += (double)pv[i] * (double)qv[i];
+    const double den = (double)pairwise_sum(pv.data(), pv.size()) + 1e-8;
+    return (q + (double)n_tot * (num / den)) / (1.0 + (double)n_tot);
+}
+
+// completedQ（gumbel.py:145）
+void kg_completed_q(const float* pi, const int64_t* N, const float* QSUM, int n, double q,
+                    float* out) {
+    const float vmf = (float)kg_vmix(pi, N, QSUM, n, q);
+    for (int i = 0; i < n; ++i) out[i] = vmf;
+    for (int i = 0; i < n; ++i)
+        if (N[i] > 0) out[i] = QSUM[i] / (float)N[i];
+}
+
+// σ(q̂)（gumbel.py:157）：q̂ 用本节点 completed Q 的量程归一
+void kg_qtransform(const float* pi, const int64_t* N, const float* QSUM, int n, double q,
+                   double c_visit, double c_scale, float* out) {
+    kg_completed_q(pi, N, QSUM, n, q, out);
+    if (n <= 0) return;
+    float qmin = out[0], qmax = out[0];
+    int64_t nmax = 0;
+    for (int i = 0; i < n; ++i) {
+        if (out[i] < qmin) qmin = out[i];
+        if (out[i] > qmax) qmax = out[i];
+        if (N[i] > nmax) nmax = N[i];
+    }
+    const float span = (float)(((double)qmax - (double)qmin) + 1e-8);
+    const float fv = (float)c_visit + (float)nmax;
+    const float cs = (float)c_scale;
+    for (int i = 0; i < n; ++i)
+        out[i] = fv * cs * ((out[i] - qmin) / span);
+}
+
+// select_action 快路径（gumbel.py:180-215）：非根确定性选择
+int kg_select_action_impl(const float* logits, int n, const int64_t* N, const float* QSUM,
+                          double q, double c_visit, double c_scale, int* out) {
+    if (n <= 0) return -2;
+    std::vector<float> pi((size_t)n);
+    kg_softmax_into(logits, n, pi.data());
+    int64_t n_total = 0;
+    for (int i = 0; i < n; ++i) n_total += N[i];
+    int best = 0;
+    if (n_total == 0) {
+        // completed Q 全 = v̂ ⇒ σ ≡ 0 ⇒ π_imp = π；frac = N/1（全 0 ⇒ 不减）
+        for (int i = 1; i < n; ++i)
+            if (pi[i] - ((float)N[i] / 1.0f) > pi[best] - ((float)N[best] / 1.0f)) best = i;
+        *out = best;
+        return 0;
+    }
+    std::vector<float> qv, pv;
+    for (int i = 0; i < n; ++i) {
+        if (N[i] > 0) {
+            qv.push_back(QSUM[i] / (float)N[i]);
+            pv.push_back(pi[i]);
+        }
+    }
+    double num = 0.0;
+    for (size_t i = 0; i < pv.size(); ++i) num += (double)pv[i] * (double)qv[i];
+    const double den = (double)pairwise_sum(pv.data(), pv.size()) + 1e-8;
+    const double n_tot = (double)n_total;
+    const double vm = (q + n_tot * (num / den)) / (1.0 + n_tot);
+    std::vector<float> cq((size_t)n, (float)vm);
+    for (int i = 0, k = 0; i < n; ++i)
+        if (N[i] > 0) cq[i] = qv[(size_t)k++];
+    float qmin = cq[0], qmax = cq[0];
+    int64_t nmax = 0;
+    for (int i = 0; i < n; ++i) {
+        if (cq[i] < qmin) qmin = cq[i];
+        if (cq[i] > qmax) qmax = cq[i];
+        if (N[i] > nmax) nmax = N[i];
+    }
+    const float span = (float)(((double)qmax - (double)qmin) + 1e-8);
+    const float fv = (float)c_visit + (float)nmax;
+    const float cs = (float)c_scale;
+    std::vector<float> imp((size_t)n);
+    for (int i = 0; i < n; ++i)
+        imp[i] = logits[i] + (fv * cs * ((cq[i] - qmin) / span));
+    kg_softmax_into(imp.data(), n, imp.data());
+    const float fn = (float)(1 + n_total);
+    for (int i = 1; i < n; ++i)
+        if (imp[i] - ((float)N[i] / fn) > imp[best] - ((float)N[best] / fn)) best = i;
+    *out = best;
+    return 0;
+}
+
+// π′ = softmax(ℓ + σ(completedQ))（gumbel.py:175）
+void kg_pi_prime_impl(const float* logits, int n, const int64_t* N, const float* QSUM, double q,
+                      double c_visit, double c_scale, float* out) {
+    std::vector<float> pi((size_t)n), s((size_t)n), z((size_t)n);
+    kg_softmax_into(logits, n, pi.data());
+    kg_qtransform(pi.data(), N, QSUM, n, q, c_visit, c_scale, s.data());
+    for (int i = 0; i < n; ++i) z[i] = logits[i] + s[i];
+    kg_softmax_into(z.data(), n, out);
+}
+
+// gumbel_topm 的排序语义（gumbel.py:227）：稳定 argsort(-(noise+ℓ))[:m]，noise 由 Python 给
+int kg_topm_impl(const float* logits, int n, const float* noise, int m0, int* out) {
+    std::vector<float> score((size_t)n);
+    for (int i = 0; i < n; ++i) score[i] = noise[i] + logits[i];
+    std::vector<int> idx((size_t)n);
+    for (int i = 0; i < n; ++i) idx[i] = i;
+    std::stable_sort(idx.begin(), idx.end(),
+                     [&](int a, int b) { return score[a] > score[b]; });
+    const int m = std::min(m0, n);
+    for (int i = 0; i < m; ++i) out[i] = idx[i];
+    return m;
+}
+
+}  // namespace
+
+KP_API int kg_softmax(const float* x, int n, float* out) {
+    KP_TRY
+    if (n <= 0) throw std::runtime_error("kg_softmax: n<=0");
+    kg_softmax_into(x, n, out);
+    return 0;
+    KP_CATCH(-2)
+}
+
+KP_API int kg_select_action(const float* logits, int n, const int64_t* N, const float* QSUM,
+                            double q, double c_visit, double c_scale, int* out) {
+    KP_TRY
+    return kg_select_action_impl(logits, n, N, QSUM, q, c_visit, c_scale, out);
+    KP_CATCH(-2)
+}
+
+KP_API int kg_pi_prime(const float* logits, int n, const int64_t* N, const float* QSUM, double q,
+                       double c_visit, double c_scale, float* out) {
+    KP_TRY
+    if (n <= 0) throw std::runtime_error("kg_pi_prime: n<=0");
+    kg_pi_prime_impl(logits, n, N, QSUM, q, c_visit, c_scale, out);
+    return 0;
+    KP_CATCH(-2)
+}
+
+KP_API int kg_topm(const float* logits, int n, const float* noise, int m0, int* out) {
+    KP_TRY
+    return kg_topm_impl(logits, n, noise, m0, out);
+    KP_CATCH(-2)
+}

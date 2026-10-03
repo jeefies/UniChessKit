@@ -100,6 +100,13 @@ _SIGNATURES = {
     "kp_root_fen": (ctypes.c_int, [_c_void_p, ctypes.c_char_p, ctypes.c_int]),
     "kp_pairwise_f32": (ctypes.c_float, [_f32p, ctypes.c_int]),
     "kp_pairwise_f64": (ctypes.c_double, [_f64p, ctypes.c_int]),
+    # Gumbel 顺序减半的节点级算术（数值等价契约见 puct_native.cpp 顶部）
+    "kg_softmax": (ctypes.c_int, [_f32p, ctypes.c_int, _f32p]),
+    "kg_select_action": (ctypes.c_int, [_f32p, ctypes.c_int, _i64p, _f32p, ctypes.c_double,
+                                        ctypes.c_double, ctypes.c_double, _intp]),
+    "kg_pi_prime": (ctypes.c_int, [_f32p, ctypes.c_int, _i64p, _f32p, ctypes.c_double,
+                                   ctypes.c_double, ctypes.c_double, _f32p]),
+    "kg_topm": (ctypes.c_int, [_f32p, ctypes.c_int, _f32p, ctypes.c_int, _intp]),
 }
 
 
