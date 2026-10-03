@@ -231,7 +231,8 @@ class Trainer:
             if best_name and not (self.out / best_name).exists():
                 self._export(model, step, best_name)
                 best = float(step)
-            return {"state": "completed", "step": step, "best": best}
+            return {"state": "completed", "step": step, "best": best,
+                    "peak_vram_mb": _peak_vram_mb()}
 
         ctx = TrainContext(model, device, cfg, self.out)
         ctx.step = step
@@ -407,7 +408,18 @@ class Trainer:
             task_close = _optional(task, "close")
             if task_close:
                 task_close()
-        return {"state": state, "step": step, "best": best}
+        return {"state": state, "step": step, "best": best,
+                "peak_vram_mb": _peak_vram_mb()}
+
+
+def _peak_vram_mb():
+    """torch 分配器的历史峰值（MiB）；不含 CUDA context。只用于显存调参对照。"""
+    try:
+        if torch.cuda.is_available():
+            return int(torch.cuda.max_memory_allocated() // (1024 * 1024))
+    except Exception:  # noqa: BLE001 —— 记录用，绝不影响训练
+        pass
+    return None
 
 
 def run_train(config_path, **overrides) -> dict:
