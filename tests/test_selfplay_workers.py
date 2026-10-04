@@ -60,6 +60,23 @@ class TestSelfplayWorkers(unittest.TestCase):
             self.assertEqual(s2["games"], 0, s2)
             self.assertEqual(s2["skipped_done"], 4)
 
+    def test_threads_same_games_as_single_thread(self):
+        """单进程多线程（threads>1）与单线程产出逐局相同（假模型批不变，可强断言）。"""
+        with tempfile.TemporaryDirectory(prefix="kit_spth1_") as t1, \
+                tempfile.TemporaryDirectory(prefix="kit_spth2_") as t2:
+            c1 = _conf(Path(t1), games=4, workers=1)
+            c1["selfplay"]["threads"] = 1
+            s1 = run_selfplay_config(c1)
+
+            c2 = _conf(Path(t2), games=4, workers=1)
+            c2["selfplay"].update(threads=2, concurrency=2)
+            s2 = run_selfplay_config(c2)
+
+            self.assertEqual(s2["games"], 4)
+            self.assertEqual(s2["termination"], s1["termination"])
+            self.assertEqual(s2["plies"], s1["plies"])
+            self.assertEqual(s2["book_plies"], s1["book_plies"])
+
 
 if __name__ == "__main__":
     unittest.main()

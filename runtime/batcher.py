@@ -9,6 +9,7 @@ Batcher 只做一件事：把一拍里各协程交出的 EvalRequest 按 model_k
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator, Optional
 
@@ -135,3 +136,68 @@ class CoroutinePool:
                 continue
             slots[i] = [job_id, gen, req]
             return
+
+
+class ThreadedCoroutinePool:
+    """单进程多线程版 ``CoroutinePool``：N 个线程各跑一个池 + 各自己的 ``Batcher``。
+
+    为什么：搜索的瓶颈是"单线程喂不动 GPU"——批量小、kernel 发射开销占比高，
+    GPU 利用率只有 ~30%。多进程（``selfplay.workers``）会建多个 CUDA context、
+    在 GPU 上互相切换反而更慢；**线程共享同一个 context**，各自成批后在 GPU 上
+    交错执行，能把利用率吃满。
+
+    语义：
+    - 线程内与 ``CoroutinePool`` 相同（逐局、按完成顺序回调）——单线程可复现性不变；
+    - 线程间批组成不同 ⇒ **跨线程不逐位可复现**（与并发 > 1 同口径，统计等价）；
+    - ``on_done`` 会被多线程调用：调用方负责线程安全（自对弈走一把锁）；
+    - 任一线程抛异常 → 通知其它线程停止取新局，原样抛给调用方。
+    """
+
+    def __init__(self, threads: int, concurrency: int,
+                 batcher_factory: Optional[Callable[[], Batcher]] = None):
+        if threads < 1:
+            raise ValueError("threads 必须 >= 1")
+        if concurrency < 1:
+            raise ValueError("concurrency 必须 >= 1")
+        self.threads = int(threads)
+        self.concurrency = int(concurrency)
+        self.batcher_factory = batcher_factory or Batcher
+        self.batchers: list = []                 # 建过的 batcher（汇总统计用）
+
+    def run(self, jobs: Iterable, on_done: Callable[[Any, Any], None],
+            should_stop: Callable[[], bool] = lambda: False) -> None:
+        if self.threads == 1:
+            b = self.batcher_factory()
+            self.batchers.append(b)
+            CoroutinePool(self.concurrency, b).run(jobs, on_done, should_stop)
+            return
+
+        jobs = list(jobs)
+        chunks: list = [[] for _ in range(self.threads)]
+        for i, job in enumerate(jobs):
+            chunks[i % self.threads].append(job)   # 交错分，线程间负载均衡
+
+        stop_flag = threading.Event()
+        errors: list = []
+        lock = threading.Lock()
+
+        def worker(chunk):
+            try:
+                b = self.batcher_factory()
+                with lock:
+                    self.batchers.append(b)
+                CoroutinePool(self.concurrency, b).run(
+                    chunk, on_done, should_stop=lambda: should_stop() or stop_flag.is_set())
+            except BaseException as exc:          # noqa: BLE001 —— 原样抛给调用方
+                with lock:
+                    errors.append(exc)
+                stop_flag.set()
+
+        ts = [threading.Thread(target=worker, args=(c,), name=f"kit-sp-{i}", daemon=True)
+              for i, c in enumerate(chunks)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        if errors:
+            raise errors[0]

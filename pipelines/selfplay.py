@@ -28,6 +28,7 @@ import dataclasses
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,7 @@ import numpy as np
 from ..api.types import GameStart, MoveDecision, PlayerError, SearchBudget
 from ..rules.openings import parse_line
 from ..rules.referee import StandardReferee
-from ..runtime.batcher import Batcher, CoroutinePool
+from ..runtime.batcher import Batcher, CoroutinePool, ThreadedCoroutinePool
 
 
 @dataclass(frozen=True)
@@ -53,12 +54,13 @@ class SelfPlayConfig:
     simulations: Optional[int] = None   # 覆盖 Player 默认模拟数
     first_game: int = 0                 # 全局局序号起点（多进程分片：各进程取不相交区间）
     workers: int = 1                    # 多进程分片：每 worker 一个进程 + 一个独立分片（.w{i}.sp.bin）
+    threads: int = 1                    # 单进程内多线程池（共享一个 CUDA context；见 ThreadedCoroutinePool）
 
     def __post_init__(self):
         if (self.games < 0 or self.max_plies < 1 or self.concurrency < 1 or self.book_plies < 0
-                or self.first_game < 0 or self.workers < 1):
+                or self.first_game < 0 or self.workers < 1 or self.threads < 1):
             raise ValueError("games / book_plies / first_game >= 0，max_plies / concurrency / "
-                             "workers >= 1")
+                             "workers / threads >= 1")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -162,12 +164,18 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
     referee = StandardReferee(max_plies=cfg.max_plies)
     budget = SearchBudget(simulations=cfg.simulations, add_noise=True)
     batcher = Batcher()
-    pool = CoroutinePool(cfg.concurrency, batcher)
+    if cfg.threads > 1:
+        # 单进程多线程：共享一个 CUDA context（多进程的 context 切换反而更慢），
+        # 各线程一个 Batcher 并行喂 GPU。on_done 会被多线程调用 ⇒ 用锁串行化收尾。
+        pool = ThreadedCoroutinePool(cfg.threads, cfg.concurrency)
+        done_lock: Optional[threading.Lock] = threading.Lock()
+    else:
+        pool = CoroutinePool(cfg.concurrency, batcher)
+        done_lock = None
     totals = {"games": 0, "plies": 0, "book_plies": 0, "termination": {}}
     t0 = time.perf_counter()
 
-    def on_done(_gid, out):
-        record, board, decisions = out
+    def _finalize(record, board, decisions):
         sink.on_game_end(record, board, decisions)
         totals["games"] += 1
         totals["plies"] += record["plies"]
@@ -177,15 +185,31 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
         if progress is not None:
             progress(record, totals["games"])
 
+    def on_done(_gid, out):
+        record, board, decisions = out
+        if done_lock is not None:
+            with done_lock:
+                _finalize(record, board, decisions)
+        else:
+            _finalize(record, board, decisions)
+
     jobs = ((t.game, (lambda t=t: play_selfplay_game(t, make_player(), referee, budget,
                                                      cfg.seed)))
             for t in tasks)
     pool.run(jobs, on_done, should_stop=should_stop or (lambda: False))
     elapsed = time.perf_counter() - t0
+    if cfg.threads > 1:
+        batch_stats: dict = {}
+        for b in pool.batchers:
+            for k, v in b.stats.as_dict().items():
+                if isinstance(v, (int, float)):
+                    batch_stats[k] = batch_stats.get(k, 0) + v
+    else:
+        batch_stats = batcher.stats.as_dict()
     return {**totals, "termination": dict(sorted(totals["termination"].items())),
             "games_planned": cfg.games, "opening_lines": len(lines),
             "opening_lines_dropped": dropped, "elapsed_s": round(elapsed, 1),
-            "batch": batcher.stats.as_dict(), "config": cfg.to_dict()}
+            "batch": batch_stats, "config": cfg.to_dict()}
 
 
 # ------------------------------------------------------------------ 命令行
