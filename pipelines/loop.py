@@ -85,7 +85,7 @@ PHASES = ("selfplay", "train", "search", "arena")
 # 拼错的占位符（{selfplay_dirr}）不会被替换，却会原样带进子进程配置里，直到要写文件
 # 那一刻才炸——所以启动时对配置里的 token 做一次体检，只告警不拦。
 PLACEHOLDERS = ("{weights}", "{candidate}", "{gen}", "{gen_dir}", "{selfplay_dir}",
-                "{selfplay_files}")
+                "{selfplay_files}", "{selfplay_dirs}")
 _OTHER_TOKENS = ("{step}",)          # Kit/train 的 export.every_name 用
 _TOKEN = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
@@ -239,12 +239,16 @@ class Loop:
     def mapping(self, g: int, champion: str) -> dict:
         window = int(self.conf.get("window", 1))
         files = []
+        dirs = []
         for h in range(max(0, g - window + 1), g + 1):
             d = self.gen_dir(h) / "selfplay"
-            files += sorted(str(p) for p in d.glob("*.sp.bin")) if d.exists() else []
+            if d.exists():
+                dirs.append(str(d))
+                files += sorted(str(p) for p in d.glob("*.sp.bin"))
         gd = self.gen_dir(g)
         return {"{weights}": champion, "{gen}": g, "{gen_dir}": str(gd),
                 "{selfplay_dir}": str(gd / "selfplay"), "{selfplay_files}": files,
+                "{selfplay_dirs}": dirs,
                 "{candidate}": self.candidate_path(g, None)}
 
     # ------------------------------------------------------------ 枚举搜索

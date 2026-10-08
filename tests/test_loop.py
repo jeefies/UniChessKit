@@ -106,15 +106,21 @@ class TestLoopMapping(unittest.TestCase):
         _write_spard(base / "gen_0001" / "selfplay", "b.sp.bin")
         _write_spard(base / "gen_0002" / "selfplay", "c.sp.bin")
         # window=2 = 本代 + 上一代：第 2 代带 gen_0001/0002，gen_0000 已滑出窗口
-        files = self.loop.mapping(2, "/w")["{selfplay_files}"]
+        m = self.loop.mapping(2, "/w")
+        files = m["{selfplay_files}"]
+        dirs = m["{selfplay_dirs}"]
         self.assertEqual([Path(f).name for f in files], ["b.sp.bin", "c.sp.bin"])
         self.assertEqual([Path(f).parent.parent.name for f in files],
                          ["gen_0001", "gen_0002"])
+        self.assertEqual([Path(d).parent.name for d in dirs], ["gen_0001", "gen_0002"])
         self.assertEqual(self.loop.mapping(0, "/w")["{selfplay_files}"],
                          [str(base / "gen_0000" / "selfplay" / "a.sp.bin")])
+        self.assertEqual(self.loop.mapping(0, "/w")["{selfplay_dirs}"],
+                         [str(base / "gen_0000" / "selfplay")])
 
     def test_mapping_survives_missing_dirs(self):
         self.assertEqual(self.loop.mapping(7, "/w")["{selfplay_files}"], [])
+        self.assertEqual(self.loop.mapping(7, "/w")["{selfplay_dirs}"], [])
 
 
 class _Stop(Exception):
