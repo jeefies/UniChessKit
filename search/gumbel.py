@@ -407,9 +407,11 @@ class GumbelConfig:
     claim_draw: bool = True         # 搜索内把可申和（三次重复 / 五十步）当终局（S 口径）
     parallel: bool = True           # 轮内各候选并发模拟（见 order_halving_gen；False = 原串行次序）
     expand_width: int = 1           # 每次前向多展开几个叶子（C++ kg_* 独有；1 = 每拍一次着法）。
-    # 自对弈是 Python↔C++ 波次往返绑定的（每搜索 ~375 拍），把前沿节点的 top-k 动作
-    # 合并进同一次前向可不改语义地减少往返：未访问的展开只是缓存，N/QSUM 与选择序列
-    # 不变（拼批带来的 ULP 差异仍在"数值等价非逐位"契约内）。Python 参考实现不实现它。
+    # 和棋与重复惩罚项（默认 0 不影响既有基线与对拍）
+    contempt: float = 0.0           # 优势方对三次重复的惩罚 (>=2 兵优势时，调高 child.q 相当于扣减 parent 动作价值)
+    stalemate_penalty: float = 0.0  # 优势方逼和对方的惩罚 (>=1 兵优势时，通常 1.0 = 判负)
+    insufficient_penalty: float = 0.0 # 优势方兑光子力成和的惩罚 (>=2 兵优势时，通常 0.2~0.3)
+    twofold_penalty: float = 0.0    # 优势方走入二次重复的惩罚 (>=2 兵优势时，通常 0.1~0.2)
 
 
 @dataclass
@@ -429,6 +431,16 @@ class GumbelResult:
 def terminal_q(board: chess.Board, claim_draw: bool = True) -> float:
     """终局真值（行棋方视角）：被将死 −1，和棋 0。"""
     return _outcome_q(board, fast_outcome(board, claim_draw))
+
+
+_PIECE_VALUES = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0
+}
+
+
+def _material_score(board: chess.Board, color: chess.Color) -> int:
+    return sum(len(board.pieces(pt, color)) * v for pt, v in _PIECE_VALUES.items())
 
 
 def _outcome_q(board: chess.Board, outcome) -> float:
@@ -487,14 +499,30 @@ class Gumbel:
             child_board.push(mv)
             outcome = fast_outcome(child_board, cfg.claim_draw)
             if outcome is not None:
+                q = _outcome_q(child_board, outcome)
+                if outcome.winner is None and (cfg.stalemate_penalty > 0 or cfg.insufficient_penalty > 0 or cfg.contempt > 0):
+                    p_col = not child_board.turn
+                    net_mat = _material_score(parent.board, p_col) - _material_score(parent.board, child_board.turn)
+                    if net_mat >= 1 and outcome.termination == chess.Termination.STALEMATE and cfg.stalemate_penalty > 0:
+                        q = float(cfg.stalemate_penalty)
+                    elif net_mat >= 2 and outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL and cfg.insufficient_penalty > 0:
+                        q = float(cfg.insufficient_penalty)
+                    elif net_mat >= 2 and outcome.termination == chess.Termination.THREEFOLD_REPETITION and cfg.contempt > 0:
+                        q = float(cfg.contempt)
                 return Node(legal=np.zeros(0, np.int64), logits=np.zeros(0, np.float32),
-                            q=_outcome_q(child_board, outcome), depth=depth,
+                            q=q, depth=depth,
                             action=action, path=path, terminal=True, moves=[], line=line)
             (ev,) = yield from self.expander.expand(
                 [Leaf(board=child_board, parent_handle=parent.handle, move=mv)])
             node = node_from_eval(ev, depth=depth, action=action, path=path, line=line)
             node.board = child_board
+            if cfg.twofold_penalty > 0 and child_board.is_repetition(2):
+                p_col = not child_board.turn
+                net_mat = _material_score(parent.board, p_col) - _material_score(parent.board, child_board.turn)
+                if net_mat >= 2:
+                    node.q = float(min(1.0, node.q + cfg.twofold_penalty))
             return node
+
 
         res = yield from order_halving_gen(
             root_node, expand, n_sims=simulations or cfg.simulations, m0=cfg.m0,
