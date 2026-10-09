@@ -51,6 +51,7 @@ class SelfPlayConfig:
     concurrency: int = 128
     openings: Optional[str] = None      # 开局文件路径；None = 全部从初始局面开始
     book_plies: int = 6
+    min_book_plies: Optional[int] = None # 开局随机截断最小深度；None = 固定 book_plies
     simulations: Optional[int] = None   # 覆盖 Player 默认模拟数
     first_game: int = 0                 # 全局局序号起点（多进程分片：各进程取不相交区间）
     workers: int = 1                    # 多进程分片：每 worker 一个进程 + 一个独立分片（.w{i}.sp.bin）
@@ -61,6 +62,8 @@ class SelfPlayConfig:
                 or self.first_game < 0 or self.workers < 1 or self.threads < 1):
             raise ValueError("games / book_plies / first_game >= 0，max_plies / concurrency / "
                              "workers / threads >= 1")
+        if self.min_book_plies is not None and (self.min_book_plies < 0 or self.min_book_plies > self.book_plies):
+            raise ValueError(f"min_book_plies ({self.min_book_plies}) 必须在 [0, book_plies={self.book_plies}] 之间")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -96,8 +99,16 @@ def plan_selfplay(cfg: SelfPlayConfig, lines: Optional[list] = None) -> list:
     games = range(cfg.first_game, cfg.first_game + cfg.games)
     if not lines:
         return [SelfPlayTask(game=g) for g in games]
-    return [SelfPlayTask(game=g, book=tuple(lines[g % len(lines)]), book_id=g % len(lines))
-            for g in games]
+    tasks = []
+    for g in games:
+        full_line = tuple(lines[g % len(lines)])
+        if cfg.min_book_plies is not None and cfg.min_book_plies < len(full_line):
+            rng = np.random.default_rng(game_seed_sequence(cfg.seed, g))
+            k = int(rng.integers(cfg.min_book_plies, len(full_line) + 1))
+            tasks.append(SelfPlayTask(game=g, book=full_line[:k], book_id=g % len(lines)))
+        else:
+            tasks.append(SelfPlayTask(game=g, book=full_line, book_id=g % len(lines)))
+    return tasks
 
 
 def play_selfplay_game(task: SelfPlayTask, player, referee: StandardReferee,
