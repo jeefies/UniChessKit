@@ -406,6 +406,10 @@ class GumbelConfig:
     c_scale: float = C_SCALE
     claim_draw: bool = True         # 搜索内把可申和（三次重复 / 五十步）当终局（S 口径）
     parallel: bool = True           # 轮内各候选并发模拟（见 order_halving_gen；False = 原串行次序）
+    expand_width: int = 1           # 每次前向多展开几个叶子（C++ kg_* 独有；1 = 每拍一次着法）。
+    # 自对弈是 Python↔C++ 波次往返绑定的（每搜索 ~375 拍），把前沿节点的 top-k 动作
+    # 合并进同一次前向可不改语义地减少往返：未访问的展开只是缓存，N/QSUM 与选择序列
+    # 不变（拼批带来的 ULP 差异仍在"数值等价非逐位"契约内）。Python 参考实现不实现它。
 
 
 @dataclass

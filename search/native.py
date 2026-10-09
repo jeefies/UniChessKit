@@ -110,6 +110,7 @@ _SIGNATURES = {
     # Gumbel 顺序减半的搜索（树/调度；collect/apply 按拍批量）
     "kg_ctx_new": (_c_void_p, [ctypes.c_double, ctypes.c_double, ctypes.c_int, ctypes.c_int]),
     "kg_ctx_free": (None, [_c_void_p]),
+    "kg_set_expand_width": (None, [_c_void_p, ctypes.c_int]),
     "kg_set_root": (ctypes.c_int, [_c_void_p, _u64p, ctypes.c_int, ctypes.c_uint64, ctypes.c_int,
                                    ctypes.c_int, _u16p, ctypes.c_int]),
     "kg_expand_root": (ctypes.c_int, [_c_void_p, _f32p, _f32p, _f32p]),

@@ -138,8 +138,8 @@ def make_gumbel_player_factory(name: str, planes_evaluator, *, simulations: int 
                                m0: int = 16, g: float = 1.0, temperature: float = 0.0,
                                c_visit: float = C_VISIT, c_scale: float = C_SCALE,
                                claim_draw: bool = True, book_path: Optional[str] = None,
-                               book_plies: int = 10,
-                               avoid_repetition: bool = True):
+                               book_plies: int = 10, avoid_repetition: bool = True,
+                               expand_width: int = 1):
     """返回无参 PlayerFactory（每个对局新建一个 GumbelPlayer + GumbelCpp 上下文）。"""
     book = None
     if book_path:
@@ -147,7 +147,8 @@ def make_gumbel_player_factory(name: str, planes_evaluator, *, simulations: int 
         if book is None:
             raise FileNotFoundError(f"{name}: 开局书不存在：{book_path}")
     cfg = GumbelConfig(simulations=simulations, m0=m0, g=g, c_visit=c_visit,
-                       c_scale=c_scale, claim_draw=claim_draw)
+                       c_scale=c_scale, claim_draw=claim_draw,
+                       expand_width=expand_width)
 
     def factory():
         return GumbelPlayer(name, GumbelCpp(planes_evaluator, cfg), book=book,

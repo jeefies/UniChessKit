@@ -256,3 +256,81 @@ class TestGumbelCppSearchParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestGumbelCppExpandWidth(unittest.TestCase):
+    """expand_width>1：把多个波次的前向合并成一次（纯缓存语义）。
+
+    判据（假模型是逐行纯函数，故宽度不改变任何数值）：
+    - 着法 / pi' / sims_used / rounds / max_depth 与 width=1 **完全一致**；
+    - n_nodes 只增不减（多展开的节点是缓存，未被访问）；
+    - EvalRequest 往返次数严格下降（这是这个特性存在的理由）。
+    """
+
+    FENS = (
+        chess.STARTING_FEN,
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/P7/8/8/8/8/6kp/4K3 w - - 0 1",
+    )
+
+    def _run(self, board, width, sims=256, m0=16, seed=5):
+        from Kit.planes19 import BatchFnEvaluator
+        from Kit.runtime import run_sync
+        from Kit.search.gumbel import GumbelConfig
+        from Kit.search.gumbel_cpp import GumbelCpp
+        from Kit.testing import FakePlanes19Model
+
+        n_legal = len(list(board.legal_moves))
+        u = np.random.default_rng(seed).random(n_legal).astype(np.float32)
+
+        class _R:
+            def random(self, n, dtype=None):
+                return u
+
+        # 同一个假模型（salt 进哈希种子，换 salt 等于换模型，对拍就废了）
+        fake = FakePlanes19Model(salt="width_probe")
+        calls = []
+
+        def counting(xs):
+            calls.append(len(xs))
+            return fake.evaluate_planes(xs)
+
+        cpp = GumbelCpp(BatchFnEvaluator(f"fk:w{width}", counting),
+                        GumbelConfig(simulations=sims, m0=m0, g=1.0, expand_width=width))
+        r = run_sync(cpp.search(board, rng=_R(), simulations=sims))
+        return r, calls
+
+    def test_width_is_pure_cache(self):
+        """width>1 与 width=1 **逐位等价**：同着法、同 sims、同根 N/QSUM、同 π′。
+
+        （cache_only 的预建节点不备份、preexpanded 首次被走到时当叶子并清标记，
+        见 cpp 的 g_expand_siblings / g_sim_node。max_depth/n_nodes 是创建量诊断，
+        允许不同——预建了未被访问的缓存节点。）
+        """
+        for fen in self.FENS:
+            board = chess.Board(fen)
+            a, ca = self._run(board, 1)
+            b, cb = self._run(board, 4)
+            self.assertEqual(a.move, b.move, fen)
+            self.assertEqual(a.stats["sims_used"], b.stats["sims_used"], fen)
+            self.assertEqual(a.stats["rounds"], b.stats["rounds"], fen)
+            self.assertGreaterEqual(b.stats["n_nodes"], a.stats["n_nodes"], fen)
+            if a.root is not None:
+                self.assertEqual((a.root.n == b.root.n).all(), True, f"{fen} 根 N 不同")
+                self.assertEqual((a.root.q_sum == b.root.q_sum).all(), True,
+                                 f"{fen} 根 QSUM 不同")
+                _, pa = a.pi_prime(G.GumbelConfig())
+                _, pb = b.pi_prime(G.GumbelConfig())
+                self.assertLessEqual(float(np.abs(pa - pb).max()), 1e-6, fen)
+
+    def test_width_cuts_roundtrips(self):
+        for fen in self.FENS:
+            board = chess.Board(fen)
+            _, ca = self._run(board, 1)
+            _, cb = self._run(board, 4)
+            self.assertLess(len(cb), len(ca),
+                            f"{fen}: 往返 {len(ca)} -> {len(cb)} 没降")
+            self.assertLessEqual(max(cb), 16 * 4, fen)
+
+
+if __name__ == "__main__":
+    unittest.main()

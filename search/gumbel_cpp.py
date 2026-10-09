@@ -40,7 +40,11 @@ class GumbelCpp:
                                          int(bool(c.claim_draw)))
         if not self._ctx:
             raise RuntimeError(f"C++ Gumbel 初始化失败：{native.last_error()}")
-        self._cap = max(1, int(c.m0))
+        # 多叶展开：一次前向多收几个叶子（见 GumbelConfig.expand_width）。
+        # 每拍最多 候选数 × expand_width 个叶子，cap 要按这个放大。
+        self._width = max(1, int(getattr(c, "expand_width", 1)))
+        self._lib.kg_set_expand_width(self._ctx, self._width)
+        self._cap = max(1, int(c.m0)) * self._width
         self._planes = np.empty((self._cap,) + _PLANES_SHAPE, dtype=np.float32)
         self._info = (ctypes.c_int * 6)()
         self.last_stats: dict = {}

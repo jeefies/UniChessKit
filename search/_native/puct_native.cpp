@@ -1389,17 +1389,20 @@ struct GNode {
     double q = 0.0;           // 网络值 / 终局真值（均为行棋方视角）
     bool expanded = false;
     bool terminal = false;
+    bool preexpanded = false; // 多叶展开预建的缓存节点（首次被走到时当叶子，见 g_sim_node）
     int depth = 0;
 };
 
 struct Pending {
     GNodeP node;                                    // 新展开的叶子
     std::vector<std::pair<GNode*, int>> path;       // 根→叶子的每一步 (父节点, 边)
+    bool cache_only = false;                        // 多叶展开的预建节点：只填充不备份
 };
 
 struct GCtx {
     double c_visit = 50.0, c_scale = 0.1;
     int m0 = 16;
+    int expand_width = 1;           // 每次前向多展开几个叶子（1 = 每拍一次着法）
     bool claim_draw = true;
     std::vector<Hist> root_hist;
     Pos root_pos;
@@ -1469,6 +1472,56 @@ GNodeP g_expand_child(GCtx& g, GNode* parent, int edge, float* planes, int& prod
     return nullptr;
 }
 
+// 节点的访问总数（N 全 0 = 尚未被任何 sim 走到过）
+int g_n_total(const GNode* n) {
+    int64_t s = 0;
+    for (int64_t v : n->N) s += v;
+    return (int)s;
+}
+
+// 多叶展开（expand_width>1）：主展开 pending 时，把同一节点的其他高先验动作也
+// 一起展开进这次前向。**语义与 width=1 逐位等价**：预建节点带 preexpanded 标记，
+// 首次被某个 sim 走到时当作该 sim 的叶子（值 = -q，与当场新鲜展开相同）并清标记，
+// 之后按正常规则下探。因此 N/QSUM 序列、叶子序列、π′ 都不变（只有拼批带来的
+// ULP 差异），变的是**往返次数**：后续 sim 发现前沿已展开 → 本拍无需前向 →
+// kg_collect 内部跳过（produced=0 的拍不返回）。base = 根→parent 的路径。
+void g_expand_siblings(GCtx& g, GNode* parent, int skip,
+                       const std::vector<std::pair<GNode*, int>>& base,
+                       float* planes, int& produced) {
+    if (g.expand_width <= 1) return;
+    // 根层不能预展开：候选边会被**同一波**的其他候选 sim 走到，而未回填的节点
+    // moves 有着法、logits/children 还是空的（2026-10-09 段错误 bug）。根层本就
+    // 是全候选一批（≤m0 个叶子），不需要再合并；要合并的是深处的波次尾轮。
+    if (parent == g.root.get()) return;
+    const int k = (int)parent->moves.size();
+    if (k <= 1) return;
+    std::vector<std::pair<float, int>> cand;
+    cand.reserve((size_t)k);
+    for (int i = 0; i < k; ++i) {
+        if (i == skip) continue;
+        if (parent->children[(size_t)i]) continue;      // 已展开（含终局）
+        cand.push_back({parent->logits[(size_t)i], i});
+    }
+    if (cand.empty()) return;
+    const int want = g.expand_width - 1;
+    if ((int)cand.size() > want) {                      // 只要 top-want（k 很小，排序足够便宜）
+        std::sort(cand.begin(), cand.end(),
+                  [](const std::pair<float, int>& x, const std::pair<float, int>& y) {
+                      return x.first > y.first;
+                  });
+        cand.resize((size_t)want);
+    }
+    for (const auto& c : cand) {
+        std::vector<std::pair<GNode*, int>> p2 = base;
+        const size_t before = g.pending.size();
+        g_expand_child(g, parent, c.second, planes, produced, p2);
+        parent->children[(size_t)c.second]->preexpanded = true;   // 已挂上（可能终局）
+        // 只有真登记了 pending 的才是"纯缓存"（终局兄弟不产 pending，
+        // 此时 back() 会是上一条 pending——不能误标，2026-10-09 bug）
+        if (g.pending.size() > before) g.pending.back().cache_only = true;
+    }
+}
+
 // 非根下探（_simulate）：true = 有值（*out_val，node 视角）；false = 需要前向（pending 持有路径）
 bool g_sim_node(GCtx& g, GNode* node, double* out_val, float* planes, int& produced,
                 std::vector<std::pair<GNode*, int>>& path) {
@@ -1483,9 +1536,18 @@ bool g_sim_node(GCtx& g, GNode* node, double* out_val, float* planes, int& produ
     GNode* child = node->children[(size_t)a].get();
     double val;
     if (child == nullptr) {
+        const std::vector<std::pair<GNode*, int>> base = path;   // 根→node（不含最后一步）
         GNodeP nn = g_expand_child(g, node, a, planes, produced, path);
-        if (!nn) return false;
+        if (!nn) {
+            g_expand_siblings(g, node, a, base, planes, produced);
+            return false;
+        }
         val = -nn->q;
+    } else if (child->preexpanded && g_n_total(child) == 0) {
+        // 预建缓存节点首次被走到：当成本次 sim 的叶子（值与当场新鲜展开逐位相同），
+        // 清标记后后续访问恢复"已展开节点继续下探"的正常规则。
+        child->preexpanded = false;
+        val = -child->q;
     } else {
         path.push_back({node, a});
         double sub = 0.0;
@@ -1494,7 +1556,8 @@ bool g_sim_node(GCtx& g, GNode* node, double* out_val, float* planes, int& produ
     }
     node->N[(size_t)a] += 1;
     node->QSUM[(size_t)a] += (float)val;
-    return true;
+    *out_val = val;          // 必须写出：否则祖先层拿到调用方的 0.0（穿透已展开
+    return true;             // 子节点终止于终局时，Python 参考是有值传播的）
 }
 
 // 根的候选下探（_sim_root）：用候选动作 a（不走 select_action）
@@ -1504,8 +1567,12 @@ bool g_sim_root(GCtx& g, int a, float* planes, int& produced) {
     GNode* child = root->children[(size_t)a].get();
     double val;
     if (child == nullptr) {
+        const std::vector<std::pair<GNode*, int>> base = path;   // 根（空路径）
         GNodeP nn = g_expand_child(g, root, a, planes, produced, path);
-        if (!nn) return false;
+        if (!nn) {
+            g_expand_siblings(g, root, a, base, planes, produced);
+            return false;
+        }
         val = -nn->q;
     } else if (child->terminal) {
         path.push_back({root, a});
@@ -1565,6 +1632,13 @@ KP_API void* kg_ctx_new(double c_visit, double c_scale, int m0, int claim_draw) 
 
 KP_API void kg_ctx_free(void* ctx) { delete (GCtx*)ctx; }
 
+// 多叶展开宽度（1 = 默认的每拍一次着法）。见 g_expand_siblings 与 gumbel.py 的
+// GumbelConfig.expand_width：纯缓存语义，不改 N/QSUM 与选择序列。
+KP_API void kg_set_expand_width(void* ctx, int w) {
+    if (!ctx) return;
+    GCtx& g = *(GCtx*)ctx;
+    g.expand_width = std::max(1, w);
+}
 // 与 kp_set_root 同口径；返回根局面的合法着法数
 KP_API int kg_set_root(void* ctx, const uint64_t* bbs, int turn, uint64_t castling, int ep,
                        int hmc, const uint16_t* moves, int n_moves) {
@@ -1783,7 +1857,9 @@ KP_API int kg_apply(void* ctx, const float* policy, const float* promo, const fl
         p.node->q = (double)wdl[(size_t)i * 3] - (double)wdl[(size_t)i * 3 + 2];
         g.n_nodes += 1;
         if (p.node->depth > g.max_depth) g.max_depth = p.node->depth;
-        g_backup_path(p.path, p.node->q);
+        // cache_only（多叶展开预建）：只把 logits/q 填上，不备份——否则等于给这次
+        // 搜索塞进几次伪访问，N/QSUM 与 width=1 就不等价了（2026-10-09 bug）。
+        if (!p.cache_only) g_backup_path(p.path, p.node->q);
     }
     g.pending.clear();
     g.collecting = false;
