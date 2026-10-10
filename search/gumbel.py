@@ -407,11 +407,29 @@ class GumbelConfig:
     claim_draw: bool = True         # 搜索内把可申和（三次重复 / 五十步）当终局（S 口径）
     parallel: bool = True           # 轮内各候选并发模拟（见 order_halving_gen；False = 原串行次序）
     expand_width: int = 1           # 每次前向多展开几个叶子（C++ kg_* 独有；1 = 每拍一次着法）。
+    c_scale_schedule: bool = False  # 是否开启动态 c_scale 调度（开局 ~0.02 -> 残局 ~0.14；默认 False 保持基线对拍）
     # 和棋与重复惩罚项（默认 0 不影响既有基线与对拍）
     contempt: float = 0.0           # 优势方对三次重复的惩罚 (>=2 兵优势时，调高 child.q 相当于扣减 parent 动作价值)
     stalemate_penalty: float = 0.0  # 优势方逼和对方的惩罚 (>=1 兵优势时，通常 1.0 = 判负)
-    insufficient_penalty: float = 0.0 # 优势方兑光子力成和的惩罚 (>=2 兵优势时，通常 0.2~0.3)
-    twofold_penalty: float = 0.0    # 优势方走入二次重复的惩罚 (>=2 兵优势时，通常 0.1~0.2)
+    insufficient_penalty: float = 0.0 # 优势方兑光子力成和的惩罚 (>=2 兵优势时，通常 1.0 = 判负)
+    twofold_penalty: float = 0.0    # 优势方走入二次重复的惩罚 (>=2 兵优势时，通常 1.0 = 判负)
+
+
+def dynamic_c_scale(board: chess.Board, base_scale: float = C_SCALE,
+                    schedule: bool = True) -> float:
+    """根据盘面总子力与步数双轮驱动计算动态 c_scale。
+    公式：0.07 * (1 - max(0, mat - 4) / 78) + 0.07 * (ply + 20) / 128
+    区间截断保护在 [0.015, 0.150]。
+    若 schedule=False 则回退到常数 base_scale。
+    """
+    if not schedule:
+        return float(base_scale)
+    mat = _material_score(board, chess.WHITE) + _material_score(board, chess.BLACK)
+    ply = board.ply()
+    mat_factor = max(0.0, 1.0 - max(0.0, float(mat) - 4.0) / 78.0)
+    ply_factor = (float(ply) + 20.0) / 128.0
+    val = 0.07 * mat_factor + 0.07 * ply_factor
+    return float(np.clip(val, 0.015, 0.150))
 
 
 @dataclass
@@ -424,7 +442,8 @@ class GumbelResult:
         """→ (着法列表, π′ fp32)，按根的合法着顺序。"""
         if self.root is None or self.root.is_terminal:
             return [], np.zeros(0, np.float32)
-        _, probs = export_pi_prime(self.root, cfg.c_visit, cfg.c_scale)
+        curr_c_scale = dynamic_c_scale(self.root.board, cfg.c_scale, cfg.c_scale_schedule) if self.root.board is not None else cfg.c_scale
+        _, probs = export_pi_prime(self.root, cfg.c_visit, curr_c_scale)
         return list(self.root.moves), probs
 
 
@@ -491,6 +510,8 @@ class Gumbel:
             return GumbelResult(None, root_node, {"sims_used": 0})
         root_node.board = copy_board(board)
 
+        curr_c_scale = dynamic_c_scale(board, cfg.c_scale, cfg.c_scale_schedule)
+
         def expand(parent: Node, action: int) -> Think[Node]:
             mv = parent.moves[action]
             line = parent.line + (mv,)
@@ -505,13 +526,25 @@ class Gumbel:
                     net_mat = _material_score(parent.board, p_col) - _material_score(parent.board, child_board.turn)
                     if net_mat >= 1 and outcome.termination == chess.Termination.STALEMATE and cfg.stalemate_penalty > 0:
                         q = float(cfg.stalemate_penalty)
-                    elif net_mat >= 2 and outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL and cfg.insufficient_penalty > 0:
+                    elif net_mat >= 1 and outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL and cfg.insufficient_penalty > 0:
                         q = float(cfg.insufficient_penalty)
                     elif net_mat >= 2 and outcome.termination == chess.Termination.THREEFOLD_REPETITION and cfg.contempt > 0:
                         q = float(cfg.contempt)
                 return Node(legal=np.zeros(0, np.int64), logits=np.zeros(0, np.float32),
                             q=q, depth=depth,
                             action=action, path=path, terminal=True, moves=[], line=line)
+
+            # 2-ply 宣和前瞻：若优势方走此步后，对方能立即宣和三次重复（或走一步即成三次重复）
+            # 劣势方必宣和，优势方直接当和棋截断并受罚
+            if (cfg.contempt > 0 or cfg.twofold_penalty > 0):
+                p_col = not child_board.turn
+                net_mat = _material_score(parent.board, p_col) - _material_score(parent.board, child_board.turn)
+                if net_mat >= 2 and child_board.can_claim_threefold_repetition():
+                    penalty = max(cfg.contempt, cfg.twofold_penalty)
+                    return Node(legal=np.zeros(0, np.int64), logits=np.zeros(0, np.float32),
+                                q=float(penalty), depth=depth,
+                                action=action, path=path, terminal=True, moves=[], line=line)
+
             (ev,) = yield from self.expander.expand(
                 [Leaf(board=child_board, parent_handle=parent.handle, move=mv)])
             node = node_from_eval(ev, depth=depth, action=action, path=path, line=line)
@@ -520,13 +553,13 @@ class Gumbel:
                 p_col = not child_board.turn
                 net_mat = _material_score(parent.board, p_col) - _material_score(parent.board, child_board.turn)
                 if net_mat >= 2:
-                    node.q = float(min(1.0, node.q + cfg.twofold_penalty))
+                    # 优势方走入二次重复，直接按重罚判负回传（child.q = twofold_penalty => parent 视角的 val = -twofold_penalty）
+                    node.q = float(cfg.twofold_penalty)
             return node
-
 
         res = yield from order_halving_gen(
             root_node, expand, n_sims=simulations or cfg.simulations, m0=cfg.m0,
-            g=cfg.g if g is None else g, rng=rng, c_visit=cfg.c_visit, c_scale=cfg.c_scale,
+            g=cfg.g if g is None else g, rng=rng, c_visit=cfg.c_visit, c_scale=curr_c_scale,
             parallel=cfg.parallel)
         res.pop("tree", None)
         return GumbelResult(root_node.moves[res["action"]], root_node, res)

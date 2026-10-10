@@ -26,11 +26,11 @@ def _coarse(s) -> tuple:
 def may_claim_threefold(board: chess.Board) -> bool:
     """False ⇒ ``board.can_claim_threefold_repetition()`` 必为 False（True 则需原函数确认）。"""
     n = len(board.move_stack)
-    h = min(board.halfmove_clock, n)
+    stack = board._stack
+    h = min(board.halfmove_clock, n, len(stack))
     seen = {(board.pawns, board.knights, board.bishops, board.rooks, board.queens, board.kings,
              board.occupied_co[chess.WHITE], board.turn)}
-    stack = board._stack
-    for j in range(n - 1, n - 1 - h, -1):
+    for j in range(len(stack) - 1, len(stack) - 1 - h, -1):
         k = _coarse(stack[j])
         if k in seen:
             return True
