@@ -214,6 +214,52 @@ def fingerprint(record: dict) -> str:
     return " ".join(record["opening"] + record["moves"])
 
 
+_PIECE_VALS = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+
+
+def _audit_draws(draw_records: list) -> dict:
+    a_blunder, b_blunder, equal = 0, 0, 0
+    for r in draw_records:
+        b = chess.Board()
+        valid = True
+        try:
+            for u in r.get("opening", []):
+                b.push_uci(u)
+        except Exception:
+            valid = False
+        if not valid:
+            equal += 1
+            continue
+
+        max_a_net, max_b_net = -999, -999
+        white_is_a = (r.get("white") == "A")
+        try:
+            for u in r.get("moves", []):
+                b.push_uci(u)
+                w_m = sum(len(b.pieces(pt, chess.WHITE)) * v for pt, v in _PIECE_VALS.items())
+                b_m = sum(len(b.pieces(pt, chess.BLACK)) * v for pt, v in _PIECE_VALS.items())
+                a_m = w_m if white_is_a else b_m
+                opp_m = b_m if white_is_a else w_m
+                net_a = a_m - opp_m
+                if net_a > max_a_net:
+                    max_a_net = net_a
+                if -net_a > max_b_net:
+                    max_b_net = -net_a
+            final_w = sum(len(b.pieces(pt, chess.WHITE)) * v for pt, v in _PIECE_VALS.items())
+            final_b = sum(len(b.pieces(pt, chess.BLACK)) * v for pt, v in _PIECE_VALS.items())
+            final_a_net = (final_w - final_b) if white_is_a else (final_b - final_w)
+
+            if final_a_net >= 3 or max_a_net >= 4:
+                a_blunder += 1
+            elif final_a_net <= -3 or max_b_net >= 4:
+                b_blunder += 1
+            else:
+                equal += 1
+        except Exception:
+            equal += 1
+    return {"a_blundered_draws": a_blunder, "b_blundered_draws": b_blunder, "equal_draws": equal}
+
+
 def summarize(records: list, cfg: MatchConfig, names: dict) -> dict:
     records = sorted(records, key=lambda r: r["game"])
     n = len(records)
@@ -237,6 +283,7 @@ def summarize(records: list, cfg: MatchConfig, names: dict) -> dict:
     for r in records:
         for side in ("A", "B"):
             sources[side].update(r["sources"][side])
+    draw_audit = _audit_draws([r for r in records if r["a_score"] == 0.5])
     out = {
         "a": names.get("A"), "b": names.get("B"),
         "games": n, "pairs_complete": len(pair_scores),
@@ -250,6 +297,7 @@ def summarize(records: list, cfg: MatchConfig, names: dict) -> dict:
         "duplicate_rate": 1.0 - distinct / n if n else 0.0,
         "by_color": color,
         "sources": {k: dict(sorted(v.items())) for k, v in sources.items()},
+        "draw_attribution": draw_audit,
         "mean_plies": sum(r["plies"] for r in records) / n if n else 0.0,
     }
     if cfg.sprt is not None:
@@ -582,7 +630,7 @@ def main(argv=None) -> int:
                         progress=None if args.quiet else _print_progress)
     brief = {k: summary[k] for k in ("a", "b", "games", "a_wins", "b_wins", "draws", "score_a",
                                      "elo", "elo_ci95", "pentanomial", "distinct_games",
-                                     "termination", "batch", "elapsed_s")}
+                                     "termination", "draw_attribution", "batch", "elapsed_s")}
     if "sprt" in summary:
         brief["sprt"] = summary["sprt"]
     print(json.dumps(brief, ensure_ascii=False, indent=2))
