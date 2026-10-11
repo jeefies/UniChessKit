@@ -351,11 +351,13 @@ def main(argv=None) -> int:
     ap.add_argument("config", help="JSON：{\"engine\": EngineSpec, \"selfplay\": {...}, \"sink\": {...}}")
     ap.add_argument("--summary-out", default=None, help="汇总 JSON 另写到该文件（多进程 worker 用）")
     args = ap.parse_args(argv)
-    conf = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    # 路径一律绝对化：调用方（如 SSM 的 run_gpu_server_selfplay.py）以 import 根为 cwd 起
+    # 子进程，相对路径会被解释到另一个目录上去（2026-10-11 踩过：worker 找不到 config.json）。
+    conf = json.loads(Path(args.config).resolve().read_text(encoding="utf-8"))
     summary = run_selfplay_config(conf)
     text = json.dumps(summary, ensure_ascii=False, indent=2)
     if args.summary_out:
-        Path(args.summary_out).write_text(text, encoding="utf-8")
+        Path(args.summary_out).resolve().write_text(text, encoding="utf-8")
     print(text)
     return 0
 
