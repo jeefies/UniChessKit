@@ -57,6 +57,10 @@ S 的编码在 `SSM/` 自己那边）。
 
 标准库 `unittest`，无 pytest。
 
+**绝对禁止 `python -c` / 内联脚本**（本机 PowerShell → ssh → bash 多层引号必把它拆坏，
+中文报错刷屏、参数丢失，已反复浪费轮次）。要看输出就本机写好 `.py` 再 scp 过去执行，
+临时脚本放远端 `~/UniChess/tmp/`（pro：`/root/autodl-tmp/fwj/UniChess/tmp/`）。
+
 ```bash
 # 全量（cwd = ~/UniChess，-t 指向 import 根；tests 是命名空间包，-t 必须给对）
 cd ~/UniChess && export UNICHESS_IMPORT_ROOT=~/UniChess
