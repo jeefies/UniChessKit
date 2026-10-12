@@ -405,7 +405,8 @@ def run_selfplay_workers(conf: dict, cfg: SelfPlayConfig, spec,
                 pass
 
     total = {"games": 0, "plies": 0, "book_plies": 0, "termination": {},
-             "skipped_done": 0, "workers": len(procs)}
+             "skipped_done": 0, "workers": len(procs),
+             "dual_engine": conf.get("engine_b") is not None}
     for s in summaries:
         for k in ("games", "plies", "book_plies", "skipped_done"):
             total[k] += int(s.get(k, 0))

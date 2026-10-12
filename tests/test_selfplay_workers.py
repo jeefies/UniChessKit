@@ -57,6 +57,7 @@ class TestSelfplayWorkers(unittest.TestCase):
             self.assertEqual(s["games"], 4, s)
             self.assertEqual(s["workers"], 2)
             self.assertGreater(s["plies"], 0)
+            self.assertFalse(s["dual_engine"])
 
             shards = sorted(td.glob("*.sp.bin"))
             self.assertEqual([p.name for p in shards],
@@ -87,6 +88,7 @@ class TestSelfplayWorkers(unittest.TestCase):
             self.assertEqual(s2["termination"], s1["termination"])
             self.assertEqual(s2["plies"], s1["plies"])
             self.assertEqual(s2["book_plies"], s1["book_plies"])
+            self.assertFalse(s2["dual_engine"])
 
     def test_dual_engine_passthrough(self):
         """``engine_b`` 经工头原样进子进程：两个工厂都加载、分片正常、颜色按局号分配。
@@ -104,6 +106,7 @@ class TestSelfplayWorkers(unittest.TestCase):
             s = run_selfplay_config(conf)
             self.assertEqual(s["games"], 4, s)
             self.assertEqual(s["workers"], 2)
+            self.assertTrue(s["dual_engine"])
 
             shards = sorted(td.glob("*.sp.bin"))
             self.assertEqual([p.name for p in shards],
