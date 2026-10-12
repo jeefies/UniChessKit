@@ -82,7 +82,8 @@ class SearchPlayer:
             seed = int(np.random.SeedSequence(seed, spawn_key=(int(start.index),))
                        .generate_state(1, dtype=np.uint32)[0])
         self._reset(seed)
-        self.record_visits = start.both_sides      # 自对弈：决策里带根访问分布（训练目标）
+        # both_sides（单 Player 执双方）隐含要录访问分布；双引擎自对弈由 record_visits 显式打开
+        self.record_visits = bool(start.both_sides or start.record_visits)
         # pipelines.selfplay 的 GameStart.book：前若干 ply 原样走出，不搜索。
         # 这些 ply 没有访问分布，sink 自动跳过，与 polyglot 书的行为一致。
         # 不认这个字段的话，开局注入会让整批自对弈以 PlayerError 中止。

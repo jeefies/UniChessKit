@@ -12,7 +12,8 @@ import numpy as np
 
 from Kit.api import EvalRequest, MoveDecision, PlayerError, immediate
 from Kit.pipelines.selfplay import (SelfPlayConfig, game_seed_sequence,
-                                    load_book_lines, plan_selfplay, run_selfplay)
+                                    load_book_lines, plan_selfplay, run_selfplay,
+                                    side_seed)
 
 
 class _CountEval:
@@ -72,6 +73,49 @@ class _IndexDerivedPlayer(_BookRandomPlayer):
         self.rng = np.random.default_rng(
             np.random.SeedSequence(int(start.seed), spawn_key=(int(start.index),)))
         return immediate(None)
+
+
+class _VisitsPlayer(_BookRandomPlayer):
+    """带 π′（``info["visits"]``）的假 Player：按 ``record_visits`` 开关给出。
+
+    口径照 ``GumbelPlayer``：``both_sides`` 或 ``record_visits`` 任一为真就录 π′，
+    开局 ply 也照常搜索产出 π′（book 着法原样走、目标留在分片里）。
+    ``info["engine"]`` 标出是哪个引擎走的，供双引擎测试断言行棋方。
+    """
+
+    def __init__(self, ev, name, obey_book=True, salt=1):
+        super().__init__(ev, obey_book)
+        self.name = name
+        self.salt = salt
+        self.record_visits = False
+        self.start = None
+
+    def new_game(self, start):
+        self.record_visits = bool(start.both_sides or start.record_visits)
+        self.start = start
+        self.rng = np.random.default_rng(
+            np.random.SeedSequence(int(start.seed), spawn_key=(int(start.index),)))
+        return immediate(None)
+
+    def choose(self, board, budget):
+        yield EvalRequest(self.ev, [board.fen()])
+        ply = len(board.move_stack)
+        moves = list(board.legal_moves)
+        pick = moves[int(self.rng.integers(len(moves)))]
+        if self.obey_book and ply < len(self.start.book):
+            dec = MoveDecision(chess.Move.from_uci(self.start.book[ply]), source="book",
+                               info={"ply": ply})
+        else:
+            dec = MoveDecision(pick, source="search", info={"ply": ply})
+        if self.record_visits:
+            # 确定性假 π′：概率只取决于 (引擎, ply, 着法序号)，两次运行完全一致
+            raw = np.array([1.0 + ((i * 5 + self.salt + ply) % 7) for i in range(len(moves))],
+                           dtype=np.float64)
+            probs = raw / raw.sum()
+            dec.info["visits"] = [(m.uci(), float(p)) for m, p in zip(moves, probs)]
+            dec.info["q"] = 0.25
+        dec.info["engine"] = self.name
+        return dec
 
 
 class _Sink:
@@ -373,6 +417,162 @@ class TestPerGameSeed(unittest.TestCase):
             parts += sorted((r["game"], tuple(r["moves"])) for r, _, _ in sink.games)
         self.assertEqual(parts, sorted(by_game.items()))
         self.assertEqual(len(parts), 5)
+
+
+class TestDualEngine(unittest.TestCase):
+    """双引擎自对弈（``engine_b``）：颜色按局号分配、双方 π′ 都进分片、book 双侧强制。
+
+    钉住的口径（2026-10-12 为联盟自对弈 C1 加）：
+    - A 方（``engine``）原样拿全局 seed，B 方拿按局派生的另一个流（同流会让两个模型的
+      Gumbel 噪声逐 ply 同步）；
+    - 两个 Player 的 ``both_sides`` 都是 False、``record_visits`` 都是 True（π′ 要录）；
+    - 每步由行棋方搜索，双方都 observe，decisions 仍是每 ply 一条（来自行棋方）；
+    - 单引擎路径（``make_player_b=None``）行为不变：``dual_engine`` 为 False、
+      ``both_sides=True``、每步只 observe 一次。
+    """
+
+    def _run(self, games=4, concurrency=1, openings=None, obey_a=True, obey_b=True,
+             sink=None, seed=5, skip=None):
+        ev = _CountEval()
+        made = []
+
+        def make_a():
+            p = _VisitsPlayer(ev, "A", obey_a, salt=1)
+            made.append(p)
+            return p
+
+        def make_b():
+            p = _VisitsPlayer(ev, "B", obey_b, salt=3)
+            made.append(p)
+            return p
+
+        sink = sink if sink is not None else _Sink()
+        cfg = SelfPlayConfig(games=games, seed=seed, max_plies=30, concurrency=concurrency,
+                             openings=openings, book_plies=4)
+        summary = run_selfplay(cfg, make_a, sink, make_player_b=make_b, skip_games=skip)
+        return summary, sink, made
+
+    def test_colors_by_parity_both_sides_recorded(self):
+        path = _write(["e4 e5 Nf3 Nc6 Bb5", "d4 d5"])
+        try:
+            summary, sink, made = self._run(openings=path)
+        finally:
+            os.unlink(path)
+        self.assertTrue(summary["dual_engine"])
+        self.assertEqual(summary["games"], 4)
+        self.assertEqual(len(made), 8)                      # 每局两个 Player
+        by_game = {r["game"]: (r, d) for r, _, d in sink.games}
+        self.assertEqual(sorted(by_game), [0, 1, 2, 3])
+        for gid, (rec, decisions) in by_game.items():
+            a_is_white = (gid % 2 == 0)
+            book = ("e2e4", "e7e5", "g1f3", "b8c6") if gid % 2 == 0 else ("d2d4", "d7d5")
+            self.assertEqual(tuple(rec["moves"][:len(book)]), book)   # 双侧都走 book
+            self.assertEqual(rec["book_plies"], len(book))
+            self.assertEqual(len(decisions), rec["plies"])
+            self.assertEqual([d.info["ply"] for d in decisions], list(range(rec["plies"])))
+            for ply, dec in enumerate(decisions):
+                # 行棋方按颜色轮到：偶数局 A 执白（双数 ply 走白方）
+                expect = "A" if ((ply % 2 == 0) == a_is_white) else "B"
+                self.assertEqual(dec.info["engine"], expect, f"第 {gid} 局第 {ply} ply")
+                self.assertIn("visits", dec.info)            # 两侧 π′ 都在（含开局 ply）
+                self.assertGreater(len(dec.info["visits"]), 0)
+        # 两个 Player 的 new_game 参数：颜色互补、同 book、都录 π′、都不 both_sides
+        for gid in range(4):
+            pair = [p for p in made if p.start.index == gid]
+            self.assertEqual(len(pair), 2)
+            a, b = sorted(pair, key=lambda p: p.name)
+            a_is_white = (gid % 2 == 0)
+            self.assertEqual(a.start.color, a_is_white)
+            self.assertEqual(b.start.color, not a_is_white)
+            self.assertFalse(a.start.both_sides)
+            self.assertFalse(b.start.both_sides)
+            self.assertTrue(a.start.record_visits)
+            self.assertTrue(b.start.record_visits)
+            self.assertEqual(a.start.book, b.start.book)      # 同一份强制开局
+            self.assertEqual(a.start.book_id, b.start.book_id)
+            self.assertNotEqual(a.start.seed, b.start.seed)   # 双方随机数流不同
+            self.assertEqual(b.start.seed, side_seed(5, gid, "B"))
+            self.assertEqual(a.observed, rec_plies(sink, gid))  # 双方每步都 observe
+            self.assertEqual(b.observed, rec_plies(sink, gid))
+            self.assertTrue(a.closed and b.closed)
+
+    def test_reproducible_and_matches_single_engine_seed(self):
+        _, s1, _ = self._run(games=3)
+        _, s2, _ = self._run(games=3)
+        key = lambda s: {r["game"]: tuple(r["moves"]) for r, _, _ in s.games}   # noqa: E731
+        self.assertEqual(key(s1), key(s2))
+
+    def test_book_violation_raises(self):
+        path = _write(["e4 e5"])
+        try:
+            with self.assertRaises(PlayerError):
+                self._run(2, openings=path, obey_b=False)
+        finally:
+            os.unlink(path)
+
+    def test_single_engine_path_unchanged(self):
+        ev = _CountEval()
+        made = []
+
+        def make():
+            p = _VisitsPlayer(ev, "A")
+            made.append(p)
+            return p
+
+        sink = _Sink()
+        summary = run_selfplay(SelfPlayConfig(games=3, seed=5, max_plies=20, concurrency=1),
+                               make, sink)
+        self.assertFalse(summary["dual_engine"])
+        self.assertEqual(len(made), 3)
+        for (rec, _, decisions), p in zip(sink.games, made):
+            self.assertTrue(p.start.both_sides)              # 单 Player 执双方
+            self.assertTrue(p.record_visits)                 # both_sides 隐含录 π′
+            self.assertEqual(p.observed, rec["plies"])       # 每步只 observe 一次
+            self.assertEqual(len(decisions), rec["plies"])
+
+    def test_shard_records_both_sides_and_resume(self):
+        """双引擎 → SelfPlayShardSink：每 ply 一条记录（含开局 ply），续跑全跳过。"""
+        from Kit.planes19 import records as R
+        from Kit.planes19.sink import SelfPlayShardSink
+
+        book = _write(["e2e4 e7e5 g1f3 b8c6 f1b5 a7a6", "d2d4 d7d5"])
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                sink = SelfPlayShardSink(Path(d) / "dual_0000.sp.bin")
+                summary, _, _ = self._run(games=4, concurrency=2, openings=book, sink=sink)
+                self.assertEqual(summary["games"], 4)
+                shard = Path(d) / "dual_0000.sp.bin"
+                meta = [json.loads(l) for l in
+                        (Path(d) / "dual_0000.games.jsonl").read_text(encoding="utf-8")
+                        .splitlines()]
+                self.assertEqual(len(meta), 4)
+                self.assertEqual(shard.stat().st_size, sink.records * R.SELFPLAY_DTYPE.itemsize)
+                self.assertEqual(sink.records, sum(m["records"] for m in meta))
+                mm = R.open_shard(shard)
+                rows = [(int(r["game"]), int(r["ply"])) for r in mm]
+                del mm                        # 先关掉内存映射：Windows 上临时目录才删得掉
+                by_game = {}
+                for gid, ply in rows:
+                    by_game.setdefault(gid, []).append(ply)
+                for m in meta:
+                    # GumbelPlayer 口径：开局 ply 也有 π′ ⇒ 记录数 == plies
+                    self.assertEqual(m["records"], m["plies"],
+                                     f"第 {m['game']} 局：双引擎每 ply 都该有记录")
+                    self.assertEqual(by_game[m["game"]], list(range(m["plies"])))
+                # 续跑：同样的任务全被跳过，分片不再长
+                summary2, _, _ = self._run(games=4, concurrency=2, openings=book, sink=sink,
+                                           skip=sink.done_games())
+                self.assertEqual(summary2["games"], 0)
+                self.assertEqual(shard.stat().st_size, sink.records * R.SELFPLAY_DTYPE.itemsize)
+        finally:
+            os.unlink(book)
+
+
+def rec_plies(sink, gid):
+    for r, _, _ in sink.games:
+        if r["game"] == gid:
+            return r["plies"]
+    raise AssertionError(f"没有第 {gid} 局")
 
 
 if __name__ == "__main__":
