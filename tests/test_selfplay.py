@@ -530,6 +530,32 @@ class TestDualEngine(unittest.TestCase):
             self.assertEqual(p.observed, rec["plies"])       # 每步只 observe 一次
             self.assertEqual(len(decisions), rec["plies"])
 
+    def test_mirror_dual_engine_shares_one_evaluator(self):
+        """engine_b 与 engine 是同一个引擎（镜像自对弈）：必须复用同一个工厂。
+
+        两个独立工厂会造出两个 evaluator 对象、同 model_key，Batcher 以"会被错误地
+        拼进同一次前向"报错。回归测试：同 spec 时只建一个工厂，两个 Player 共享 evaluator。
+        """
+        ev = _CountEval()
+        made = []
+
+        def make_a():
+            p = _VisitsPlayer(ev, "A", True, salt=1)
+            made.append(p)
+            return p
+
+        # 同一个工厂对象给两边（镜像语义）
+        sink = _Sink()
+        cfg = SelfPlayConfig(games=3, seed=5, max_plies=20, concurrency=1)
+        summary = run_selfplay(cfg, make_a, sink, make_player_b=make_a)
+        self.assertTrue(summary["dual_engine"])
+        self.assertEqual(summary["games"], 3)
+        self.assertEqual(len(made), 6)                  # 每局两个 Player（同一工厂）
+        self.assertEqual(len({id(p) for p in made}), 6)  # 但是不同的 Player 实例
+        for (rec, _, decisions), _p in zip(sink.games, made):
+            self.assertEqual(len(decisions), rec["plies"])
+            self.assertIn("visits", decisions[0].info)   # 两侧 π′ 都在
+
     def test_shard_records_both_sides_and_resume(self):
         """双引擎 → SelfPlayShardSink：每 ply 一条记录（含开局 ply），续跑全跳过。"""
         from Kit.planes19 import records as R

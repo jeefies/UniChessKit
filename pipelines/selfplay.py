@@ -300,7 +300,15 @@ def run_selfplay_config(conf: dict, should_stop: Optional[Callable[[], bool]] = 
     sink = load_object(sink_conf["factory"], spec.root)(**sink_conf.get("kwargs", {}))
     done = sink.done_games() if hasattr(sink, "done_games") else set()
     make_player = build_player_factory(spec)
-    make_player_b = build_player_factory(spec_b) if spec_b is not None else None
+    if spec_b is None:
+        make_player_b = None
+    elif conf["engine"] == conf.get("engine_b"):
+        # 镜像自对弈（engine_b 与 engine 是同一个引擎）：复用同一个工厂，两个 Player
+        # 共享一个 evaluator。各建一个的话，两个 evaluator 对象同 model_key，Batcher 会以
+        # "会被错误地拼进同一次前向"为由报错——那个检查是对的，只是这里本就不该建两个。
+        make_player_b = make_player
+    else:
+        make_player_b = build_player_factory(spec_b)
     summary = run_selfplay(cfg, make_player, sink, should_stop=should_stop, skip_games=done,
                            make_player_b=make_player_b)
     summary["skipped_done"] = len(done & set(range(cfg.first_game, cfg.first_game + cfg.games)))
