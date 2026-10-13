@@ -1,7 +1,7 @@
 """Player 实现。它们可以互换（里氏替换），都要通过 testing.contracts 的契约测试。"""
 from .search_player import SearchPlayer, open_polyglot
-from .simple import RandomPlayer, UciPlayer
+from .simple import RandomPlayer, UciPlayer, make_uci_player_factory
 from .gumbel_player import GumbelPlayer, make_gumbel_player_factory
 
 __all__ = ["SearchPlayer", "open_polyglot", "RandomPlayer", "UciPlayer",
-           "GumbelPlayer", "make_gumbel_player_factory"]
+           "make_uci_player_factory", "GumbelPlayer", "make_gumbel_player_factory"]

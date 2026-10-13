@@ -68,3 +68,23 @@ class UciPlayer:
                 engine.quit()
             except Exception:
                 pass
+
+
+def make_uci_player_factory(command, limit: dict, *, name: str = "uci",
+                            options: Optional[dict] = None):
+    """EngineSpec 工厂：无参 PlayerFactory（每局一个 UciPlayer，惰性起 UCI 子进程）。
+
+    给 ``Kit match`` 当**外部锚点**用——自研引擎的 arena 全是内部相对 Elo（以自己冠军
+    为零点），要报绝对 Elo 必须有一个外部锚，Stockfish 是最合适的那个。例::
+
+        {"factory": "Kit.players.simple:make_uci_player_factory",
+         "kwargs": {"command": "/path/to/stockfish", "limit": {"nodes": 100000},
+                    "options": {"Threads": 1, "Hash": 16}}}
+
+    ⚠ UciPlayer **同步阻塞**：它思考时驱动器里的其他对局都在等。锚点场景（对手弱、
+    步数少、并发不高）可接受，别拿它当主力引擎跑长会战。
+    """
+    def factory():
+        return UciPlayer(name, command, dict(limit), dict(options or {}))
+    factory.search_impl = "uci"
+    return factory
