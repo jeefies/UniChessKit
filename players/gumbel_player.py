@@ -51,7 +51,8 @@ class GumbelPlayer:
             seed = int(np.random.SeedSequence(seed, spawn_key=(int(start.index),))
                        .generate_state(1, dtype=np.uint32)[0])
         self.rng = np.random.default_rng(seed)
-        self.record_visits = start.both_sides
+        # both_sides（单 Player 执双方）隐含要录 π′；双引擎自对弈由 record_visits 显式打开
+        self.record_visits = bool(start.both_sides or start.record_visits)
         self._game_book = [chess.Move.from_uci(u) for u in start.book]
         self._book_len = len(self._game_book)
         self._ply = 0

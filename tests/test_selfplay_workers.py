@@ -24,6 +24,17 @@ def make_fake_gumbel_engine(**_kw):
     return make_gumbel_player_factory("F", ev, simulations=8, m0=4, g=0.0)
 
 
+def make_fake_gumbel_engine_b(**_kw):
+    """双引擎自对弈的 B 方工厂：同一假模型、不同 salt ⇒ 两个 Player 的搜索不同。"""
+    from Kit.planes19 import BatchFnEvaluator
+    from Kit.players.gumbel_player import make_gumbel_player_factory
+    from Kit.testing import FakePlanes19Model
+
+    fake = FakePlanes19Model(salt="workers-b")
+    ev = BatchFnEvaluator("fk:workers-b", fake.evaluate_planes)
+    return make_gumbel_player_factory("G", ev, simulations=8, m0=4, g=0.0)
+
+
 def _conf(td: Path, games: int = 4, workers: int = 2) -> dict:
     return {
         "engine": {"root": IMPORT_ROOT,
@@ -46,6 +57,7 @@ class TestSelfplayWorkers(unittest.TestCase):
             self.assertEqual(s["games"], 4, s)
             self.assertEqual(s["workers"], 2)
             self.assertGreater(s["plies"], 0)
+            self.assertFalse(s["dual_engine"])
 
             shards = sorted(td.glob("*.sp.bin"))
             self.assertEqual([p.name for p in shards],
@@ -76,6 +88,48 @@ class TestSelfplayWorkers(unittest.TestCase):
             self.assertEqual(s2["termination"], s1["termination"])
             self.assertEqual(s2["plies"], s1["plies"])
             self.assertEqual(s2["book_plies"], s1["book_plies"])
+            self.assertFalse(s2["dual_engine"])
+
+    def test_dual_engine_passthrough(self):
+        """``engine_b`` 经工头原样进子进程：两个工厂都加载、分片正常、颜色按局号分配。
+
+        用 shard 里的 z 与 ply 对账两侧都在录 π′（GumbelPlayer 口径：每 ply 一条）。
+        """
+        from Kit.planes19 import records as R
+
+        with tempfile.TemporaryDirectory(prefix="kit_spdual_") as tmp:
+            td = Path(tmp)
+            conf = _conf(td, games=4, workers=2)
+            conf["engine_b"] = {"root": IMPORT_ROOT,
+                                "factory": "Kit.tests.test_selfplay_workers:make_fake_gumbel_engine_b",
+                                "kwargs": {}}
+            s = run_selfplay_config(conf)
+            self.assertEqual(s["games"], 4, s)
+            self.assertEqual(s["workers"], 2)
+            self.assertTrue(s["dual_engine"])
+
+            shards = sorted(td.glob("*.sp.bin"))
+            self.assertEqual([p.name for p in shards],
+                             ["selfplay.w0.sp.bin", "selfplay.w1.sp.bin"])
+            games, rows = set(), []
+            for sh in shards:
+                games |= SelfPlayShardSink(str(sh)).done_games()
+                mm = R.open_shard(sh)
+                rows += [(int(r["game"]), int(r["ply"])) for r in mm]
+                del mm
+            self.assertEqual(games, {0, 1, 2, 3})
+            by_game = {}
+            for gid, ply in rows:
+                by_game.setdefault(gid, []).append(ply)
+            for gid, plies in by_game.items():
+                self.assertEqual(plies, list(range(len(plies))),   # 从 ply 0 起连续
+                                 f"第 {gid} 局：双引擎每 ply（含开局）都该有记录")
+                self.assertGreater(len(plies), 0)
+
+            # 续跑：engine_b 同样透传，全部跳过
+            s2 = run_selfplay_config(conf)
+            self.assertEqual(s2["games"], 0, s2)
+            self.assertEqual(s2["skipped_done"], 4)
 
 
 if __name__ == "__main__":

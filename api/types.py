@@ -67,6 +67,8 @@ class GameStart:
 
     自对弈（``pipelines.selfplay``）另用：
     - both_sides：同一个 Player 执双方（color 无意义），每步 observe 只调用一次；
+    - record_visits：决策里带根访问分布 / π′（训练目标）。``both_sides`` 已隐含 True；
+      双引擎自对弈（两个 Player 各执一方）用它显式打开，两侧的 π′ 都要进分片；
     - book：opening 之后**仍经 choose** 的强制着法（UCI）。Player 必须原样走出，但照常搜索，
       以便给这些局面产出训练目标（S 的 book ply π′）；管线会校验，走错即 PlayerError；
     - book_id：book 在开局库里的序号（跨局共享搜索结果的键），无 book 时为 None；
@@ -78,6 +80,7 @@ class GameStart:
     game_id: str = ""
     fen: Optional[str] = None
     both_sides: bool = False
+    record_visits: bool = False              # 自对弈训练目标：决策里带根访问分布 / π′
     book: tuple = ()
     book_id: Optional[int] = None
     index: int = 0

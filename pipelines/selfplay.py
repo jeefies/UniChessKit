@@ -19,6 +19,12 @@
 - **裁决**：rules.StandardReferee（claim_draw 语义；max_plies 按整盘计，含 book）。
 - 出错整批停止（CoroutinePool 语义），Sink 不会收到半局。
 
+**双引擎（联盟自对弈）**：``run_selfplay_config`` 的配置里给可选的 ``engine_b``
+（EngineSpec）时，两个 Player 各执一方——**颜色按局号分配**（偶数局 A 执白、奇数局
+A 执黑，与 ``match`` 的成对换先同一目的），每步由行棋方搜索、双方都 observe、
+两侧的 π′ 都进分片（``GameStart.record_visits``）。book 强制、种子派生（A 用全局
+seed 原样、B 按局派生另一个流）、record 结构与单引擎同构；单引擎路径逐字节不变。
+
 可复现性：并发 1 时与 S 原生成器逐字节一致；并发 > 1 时批组成随完成顺序变化，
 ``SeqModel.step`` 的输出随批大小有 ~1e-5 浮点差，两边都只在统计意义上一致。
 """
@@ -30,6 +36,7 @@ import os
 import sys
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -111,42 +118,78 @@ def plan_selfplay(cfg: SelfPlayConfig, lines: Optional[list] = None) -> list:
     return tasks
 
 
+def side_seed(seed: int, game: int, side: str) -> int:
+    """双引擎对局里某一方的种子（``match._seed`` 的同款口径）。
+
+    两个引擎的随机数流**必须不同**：同流会让两个模型的 Gumbel 噪声逐 ply 完全同步，
+    多样性白丢。A 方（``engine``）不走这里——它原样用全局 seed，与单引擎路径同构
+    （同一局号下 A 的噪声流不变）；B 方（``engine_b``）按 ``(seed, 局号, "B")`` 派生。
+    """
+    return zlib.crc32(f"{seed}:{game}:{side}".encode()) & 0x7FFFFFFF
+
+
 def play_selfplay_game(task: SelfPlayTask, player, referee: StandardReferee,
-                       budget: SearchBudget, seed: int):
-    """一局自对弈协程 → (record, 终局 board, decisions)。结束时（含异常）关闭 Player。"""
+                       budget: SearchBudget, seed: int, player_b=None):
+    """一局自对弈协程 → (record, 终局 board, decisions)。结束时（含异常）关闭 Player。
+
+    ``player_b`` 为 None：单引擎自对弈，一个 Player 执双方（既有口径，逐字节不变）。
+    给出时：双引擎对局，两个 Player 各执一方，颜色按局号分配（见模块说明）；
+    book 强制着法由行棋方照常搜索产出 π′ 再原样走出（与单引擎同一条规则），
+    每步之后双方都 ``observe``。
+    """
     t0 = time.perf_counter()
     board = chess.Board()
     decisions: list = []
     moves: list = []
     book = [chess.Move.from_uci(u) for u in task.book]
+    dual = player_b is not None
     try:
-        yield from player.new_game(GameStart(color=chess.WHITE, seed=seed, game_id=f"g{task.game}",
-                                             both_sides=True, book=tuple(task.book),
-                                             book_id=task.book_id, index=task.game))
+        if dual:
+            a_is_white = (task.game % 2 == 0)
+            white, black = (player, player_b) if a_is_white else (player_b, player)
+            yield from player.new_game(GameStart(
+                color=a_is_white, seed=seed, game_id=f"g{task.game}",
+                book=tuple(task.book), book_id=task.book_id, index=task.game,
+                record_visits=True))
+            yield from player_b.new_game(GameStart(
+                color=not a_is_white, seed=side_seed(seed, task.game, "B"),
+                game_id=f"g{task.game}", book=tuple(task.book), book_id=task.book_id,
+                index=task.game, record_visits=True))
+        else:
+            white = black = player
+            yield from player.new_game(GameStart(color=chess.WHITE, seed=seed, game_id=f"g{task.game}",
+                                                 both_sides=True, book=tuple(task.book),
+                                                 book_id=task.book_id, index=task.game))
         while True:
             verdict = referee.verdict(board)
             if verdict is not None:
                 break
             ply = len(board.move_stack)
-            decision = yield from player.choose(board.copy(), budget)
+            mover = white if board.turn == chess.WHITE else black
+            decision = yield from mover.choose(board.copy(), budget)
             if not isinstance(decision, MoveDecision):
-                raise PlayerError(f"{player.name}.choose 应返回 MoveDecision，"
+                raise PlayerError(f"{mover.name}.choose 应返回 MoveDecision，"
                                   f"收到 {type(decision).__name__}")
             if ply < len(book) and decision.move != book[ply]:
-                raise PlayerError(f"{player.name} 在第 {ply} ply 应走 book 着法 {book[ply]}，"
+                raise PlayerError(f"{mover.name} 在第 {ply} ply 应走 book 着法 {book[ply]}，"
                                   f"却走了 {decision.move}（第 {task.game} 局）")
             if decision.move not in board.legal_moves:
-                raise PlayerError(f"{player.name} 走了非法着法 {decision.move} @ {board.fen()}"
+                raise PlayerError(f"{mover.name} 走了非法着法 {decision.move} @ {board.fen()}"
                                   f"（第 {task.game} 局）")
             board.push(decision.move)
             moves.append(decision.move.uci())
             decisions.append(decision)
-            yield from player.observe(board.copy(), decision.move)
+            if dual:
+                for p in (white, black):
+                    yield from p.observe(board.copy(), decision.move)
+            else:
+                yield from player.observe(board.copy(), decision.move)
     finally:
-        try:
-            player.close()
-        except Exception as e:  # noqa: close 失败不应掩盖真正的异常
-            print(f"[selfplay] {getattr(player, 'name', player)}.close() 失败：{e}", file=sys.stderr)
+        for p in ((player, player_b) if dual else (player,)):
+            try:
+                p.close()
+            except Exception as e:  # noqa: close 失败不应掩盖真正的异常
+                print(f"[selfplay] {getattr(p, 'name', p)}.close() 失败：{e}", file=sys.stderr)
     record = {
         "type": "game", "game": task.game, "book_id": task.book_id,
         "book_plies": min(len(book), len(moves)), "moves": moves,
@@ -159,11 +202,13 @@ def play_selfplay_game(task: SelfPlayTask, player, referee: StandardReferee,
 def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
                  progress: Optional[Callable[[dict, int], None]] = None,
                  should_stop: Optional[Callable[[], bool]] = None,
-                 skip_games: Optional[set] = None) -> dict:
+                 skip_games: Optional[set] = None,
+                 make_player_b: Optional[Callable] = None) -> dict:
     """跑 cfg.games 局自对弈，逐局调 ``sink.on_game_end``，返回汇总。
 
     make_player 为 PlayerFactory（每局一个 Player）；跨局共享的状态（如 book ply 的搜索缓存）
-    由引擎放在工厂里。
+    由引擎放在工厂里。``make_player_b`` 给出时走双引擎对局（两个工厂各执一方、颜色按局号
+    分配，见 ``play_selfplay_game``）；为 None 时是既有的单引擎口径。
     """
     lines, dropped = (load_book_lines(cfg.openings, cfg.book_plies) if cfg.openings
                       else ([], 0))
@@ -186,6 +231,12 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
     totals = {"games": 0, "plies": 0, "book_plies": 0, "termination": {}}
     t0 = time.perf_counter()
 
+    def _start(t):
+        # Player 在 job 真正开始时才建（池子占一个坑起一局），与既有口径一致
+        a = make_player()
+        b = make_player_b() if make_player_b is not None else None
+        return play_selfplay_game(t, a, referee, budget, cfg.seed, player_b=b)
+
     def _finalize(record, board, decisions):
         sink.on_game_end(record, board, decisions)
         totals["games"] += 1
@@ -204,9 +255,7 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
         else:
             _finalize(record, board, decisions)
 
-    jobs = ((t.game, (lambda t=t: play_selfplay_game(t, make_player(), referee, budget,
-                                                     cfg.seed)))
-            for t in tasks)
+    jobs = ((t.game, (lambda t=t: _start(t))) for t in tasks)
     pool.run(jobs, on_done, should_stop=should_stop or (lambda: False))
     elapsed = time.perf_counter() - t0
     if cfg.threads > 1:
@@ -220,23 +269,30 @@ def run_selfplay(cfg: SelfPlayConfig, make_player: Callable, sink,
     return {**totals, "termination": dict(sorted(totals["termination"].items())),
             "games_planned": cfg.games, "opening_lines": len(lines),
             "opening_lines_dropped": dropped, "elapsed_s": round(elapsed, 1),
-            "batch": batch_stats, "config": cfg.to_dict()}
+            "batch": batch_stats, "config": cfg.to_dict(),
+            "dual_engine": make_player_b is not None}
 
 
 # ------------------------------------------------------------------ 命令行
 
 def run_selfplay_config(conf: dict, should_stop: Optional[Callable[[], bool]] = None) -> dict:
-    """``{"engine": EngineSpec, "selfplay": SelfPlayConfig, "sink": {"factory", "kwargs"}}``。
+    """``{"engine": EngineSpec, "engine_b": EngineSpec?, "selfplay": SelfPlayConfig, "sink": {...}}``。
+
+    ``engine_b`` 可选：给出时跑双引擎对局（两个 Player 各执一方、颜色按局号分配，
+    见 ``play_selfplay_game``）——联盟自对弈用它把历史冠军拉进来当对手。
 
     sink 工厂返回带 ``on_game_end`` 的对象；若它有 ``done_games()``，已落盘的局跳过（续跑）。
-    ``selfplay.workers > 1`` 时走多进程分片（见 ``run_selfplay_workers``）。
+    ``selfplay.workers > 1`` 时走多进程分片（见 ``run_selfplay_workers``），``engine_b``
+    原样透传给每个子进程。
     """
     from ..registry import EngineSpec, build_player_factory, load_object
 
-    unknown = set(conf) - {"engine", "selfplay", "sink"}
+    unknown = set(conf) - {"engine", "engine_b", "selfplay", "sink"}
     if unknown:
         raise ValueError(f"自对弈配置有未知字段 {sorted(unknown)}")
     spec = EngineSpec.from_dict(conf["engine"])
+    spec_b = (EngineSpec.from_dict(conf["engine_b"]) if conf.get("engine_b") is not None
+              else None)
     cfg = SelfPlayConfig(**conf["selfplay"])
     if cfg.workers > 1:
         return run_selfplay_workers(conf, cfg, spec, should_stop=should_stop)
@@ -244,7 +300,17 @@ def run_selfplay_config(conf: dict, should_stop: Optional[Callable[[], bool]] = 
     sink = load_object(sink_conf["factory"], spec.root)(**sink_conf.get("kwargs", {}))
     done = sink.done_games() if hasattr(sink, "done_games") else set()
     make_player = build_player_factory(spec)
-    summary = run_selfplay(cfg, make_player, sink, should_stop=should_stop, skip_games=done)
+    if spec_b is None:
+        make_player_b = None
+    elif conf["engine"] == conf.get("engine_b"):
+        # 镜像自对弈（engine_b 与 engine 是同一个引擎）：复用同一个工厂，两个 Player
+        # 共享一个 evaluator。各建一个的话，两个 evaluator 对象同 model_key，Batcher 会以
+        # "会被错误地拼进同一次前向"为由报错——那个检查是对的，只是这里本就不该建两个。
+        make_player_b = make_player
+    else:
+        make_player_b = build_player_factory(spec_b)
+    summary = run_selfplay(cfg, make_player, sink, should_stop=should_stop, skip_games=done,
+                           make_player_b=make_player_b)
     summary["skipped_done"] = len(done & set(range(cfg.first_game, cfg.first_game + cfg.games)))
     close = getattr(sink, "close", None)
     if close:
@@ -267,6 +333,10 @@ def run_selfplay_workers(conf: dict, cfg: SelfPlayConfig, spec,
     （不同分片出现同一局号）——数量变了必须先归档旧分片再跑。
 
     父进程是"工头"：起子进程、收各自 summary、聚合返回；收到 SIGTERM 时先杀子进程再退。
+
+    配置里可选的 ``engine_b``（双引擎）随 ``w = dict(conf)`` 原样进各子进程，由子进程的
+    ``run_selfplay_config`` 校验并建两个工厂；子进程 cwd 取 A 方（``engine``）的 root，
+    B 方的相对路径由它自己的工厂负责解析（``EngineSpec.root`` 会各自挂 sys.path）。
     """
     import signal
     import subprocess
@@ -335,7 +405,8 @@ def run_selfplay_workers(conf: dict, cfg: SelfPlayConfig, spec,
                 pass
 
     total = {"games": 0, "plies": 0, "book_plies": 0, "termination": {},
-             "skipped_done": 0, "workers": len(procs)}
+             "skipped_done": 0, "workers": len(procs),
+             "dual_engine": conf.get("engine_b") is not None}
     for s in summaries:
         for k in ("games", "plies", "book_plies", "skipped_done"):
             total[k] += int(s.get(k, 0))
@@ -348,7 +419,8 @@ def main(argv=None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(description="UniChessKit 自对弈")
-    ap.add_argument("config", help="JSON：{\"engine\": EngineSpec, \"selfplay\": {...}, \"sink\": {...}}")
+    ap.add_argument("config", help="JSON：{\"engine\": EngineSpec, \"engine_b\": EngineSpec?, "
+                                   "\"selfplay\": {...}, \"sink\": {...}}")
     ap.add_argument("--summary-out", default=None, help="汇总 JSON 另写到该文件（多进程 worker 用）")
     args = ap.parse_args(argv)
     # 路径一律绝对化：调用方（如 SSM 的 run_gpu_server_selfplay.py）以 import 根为 cwd 起
