@@ -80,11 +80,12 @@ class Decoder:
     """记录 → 张量元组 (x, policy, promo, wdl[, bucket])。可 pickle（给 DataLoader worker）。"""
 
     def __init__(self, *, repair_castling: bool = True, num_buckets: int = 1, q_ratio: float = 0.0,
-                 channels_last: bool = False):
+                 channels_last: bool = False, value_from: str = "z"):
         self.repair_castling = repair_castling
         self.num_buckets = int(num_buckets)
         self.q_ratio = float(q_ratio)
         self.channels_last = channels_last
+        self.value_from = str(value_from)
 
     def __call__(self, recs: np.ndarray) -> tuple:
         import torch
@@ -92,7 +93,8 @@ class Decoder:
         x = torch.from_numpy(decode_batch(recs))
         if self.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
-        p, pr, w = decode_targets(recs, repair_castling=self.repair_castling, q_ratio=self.q_ratio)
+        p, pr, w = decode_targets(recs, repair_castling=self.repair_castling,
+                                  q_ratio=self.q_ratio, value_from=self.value_from)
         out = [x, torch.from_numpy(p), torch.from_numpy(pr), torch.from_numpy(w)]
         if self.num_buckets > 1:
             out.append(torch.from_numpy(piece_count_bucket(recs, self.num_buckets)))

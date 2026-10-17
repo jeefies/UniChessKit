@@ -146,7 +146,8 @@ class Planes19Task:
     # ------------------------------------------------------------ 数据
     def _decoder(self, d: dict) -> Decoder:
         return Decoder(repair_castling=d.get("repair_castling", True), num_buckets=self.num_buckets,
-                       q_ratio=d.get("q_ratio", 0.0), channels_last=self.channels_last)
+                       q_ratio=d.get("q_ratio", 0.0), channels_last=self.channels_last,
+                       value_from=d.get("value_from", "z"))
 
     def _to(self, batch, device):
         return tuple(t.to(device, non_blocking=True) for t in batch)
@@ -156,7 +157,8 @@ class Planes19Task:
         kind = d.pop("kind")
         device = ctx.device
         if kind == "loader":
-            _check_keys(d, ("shards", "batch_size", "shuffle", "repair_castling", "q_ratio"),
+            _check_keys(d, ("shards", "batch_size", "shuffle", "repair_castling", "q_ratio",
+                            "value_from"),
                         "data(loader)")
             ds = BatchShardDataset(ShardSet(resolve_shards(d["shards"])), self._decoder(d))
             st = self.state.setdefault("loader", {})
@@ -254,7 +256,8 @@ class Planes19Task:
         sizes = np.floor(weights / weights.sum() * bs).astype(int)
         sizes[0] += bs - sizes.sum()
         for s, n in zip(d["sources"], sizes):
-            _check_keys(s, ("shards", "weight", "q_ratio", "repair_castling"), "data(mix).source")
+            _check_keys(s, ("shards", "weight", "q_ratio", "repair_castling", "value_from"),
+                        "data(mix).source")
             sources.append((ShardSet(resolve_shards(s["shards"])), self._decoder(s), int(n)))
         update = ctx.step
         while True:

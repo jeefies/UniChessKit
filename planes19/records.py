@@ -308,11 +308,41 @@ def _sparse_policy(moves: np.ndarray, probs: np.ndarray, recs, repair: bool) -> 
     return policy
 
 
-def decode_targets(recs: np.ndarray, *, repair_castling: bool = True, q_ratio: float = 0.0):
+def wdl_g_from_records(recs: np.ndarray) -> np.ndarray:
+    """自对弈记录的 ``wdl[:,0]`` → 预计算的 λ-return 标量目标 g（行棋方视角，[−1,1]）。
+
+    自对弈记录的 wdl 字段对 sp 记录恒为 0 且解码时被忽略（``decode_targets`` 只从 z 与
+    q_ratio 构建），是现成的空位；``value_from="wdl_g"`` 用它携带预算好的 λ-return。
+    打包口径：``u16 = round((g+1)/2 · 65534) + 1 ∈ [1, 65535]``（**避开 0**，
+    分辨率 3.05e-5）⇒ 读到 0 就说明该分片没预算过，而不是"g 恰好是 0"。
+    """
+    u = recs["wdl"][:, 0].astype(np.float64)
+    return (u - 1.0) / 65534.0 * 2.0 - 1.0
+
+
+def max_entropy_wdl(g: np.ndarray) -> np.ndarray:
+    """标量期望得分 g → WDL 软目标（确定性最大熵投影，SSM D4 同款）。
+
+    ``pW = max(g,0), pD = 1−|g|, pL = max(−g,0)``——保住决胜信号的符号结构，
+    且 ``|g|=1`` 与 ``g=0`` 精确退化为 one-hot（与硬标签 MC 逐位一致）。
+    """
+    g = np.asarray(g, dtype=np.float32)
+    pW = np.maximum(g, 0.0)
+    pL = np.maximum(-g, 0.0)
+    pD = 1.0 - np.abs(g)
+    return np.stack([pW, pD, pL], axis=1).astype(np.float32)
+
+
+def decode_targets(recs: np.ndarray, *, repair_castling: bool = True, q_ratio: float = 0.0,
+                   value_from: str = "z"):
     """记录 → (policy[N,4096], promo[N] int64（-100 = ignore）, wdl[N,3])。
 
     监督记录：MultiPV 软标签与 Stockfish WDL（各自归一）。
-    自对弈记录：访问分布（归一）；WDL = (1-q_ratio)·onehot(z) + q_ratio·(q 折成的 W/L 二元分布)。
+    自对弈记录：访问分布（归一）；``value_from`` 决定价值目标：
+    - ``"z"``（默认）：WDL = (1-q_ratio)·onehot(z) + q_ratio·(q 折成的 W/L 二元分布)；
+    - ``"wdl_g"``：WDL = max_entropy_wdl(g)，g 取自 ``wdl[:,0]`` 里预算的 λ-return
+      （``wdl_g_from_records``）。g 为 0 的记录（老分片 / 未预算）**不**回退 z——
+      静默回退会让目标在两种口径间漂移，直接报错更安全。
     """
     sp = "visit_move" in recs.dtype.names
     if sp:
@@ -322,6 +352,17 @@ def decode_targets(recs: np.ndarray, *, repair_castling: bool = True, q_ratio: f
     promo = recs["promo"].astype(np.int64)
     promo = np.where(promo == NO_PROMO, -100, promo)
     if sp:
+        if value_from == "wdl_g":
+            raw = recs["wdl"][:, 0]
+            if np.any(raw == 0):
+                n_zero = int((raw == 0).sum())
+                raise ValueError(
+                    f"value_from='wdl_g' 但有 {n_zero}/{len(recs)} 条记录的保留位为 0："
+                    "该分片没预算 λ-return。用 make_lambda_shards.py 先生成，或把 "
+                    "value_from 改回 'z'——不静默回退，避免目标口径漂移")
+            return policy, promo, max_entropy_wdl(wdl_g_from_records(recs))
+        if value_from != "z":
+            raise ValueError(f"value_from 只能是 'z' / 'wdl_g'，收到 {value_from!r}")
         z = recs["z"].astype(np.int64)
         wdl = np.zeros((len(recs), 3), dtype=np.float32)
         wdl[np.arange(len(recs)), 1 - z] = 1.0                      # z=+1→W(0) 0→D(1) -1→L(2)
@@ -330,6 +371,9 @@ def decode_targets(recs: np.ndarray, *, repair_castling: bool = True, q_ratio: f
             wq = np.stack([(1 + q) / 2, np.zeros_like(q), (1 - q) / 2], axis=1)
             wdl = ((1.0 - q_ratio) * wdl + q_ratio * wq).astype(np.float32)
     else:
+        if value_from != "z":
+            raise ValueError("value_from='wdl_g' 只适用于自对弈记录（监督记录的 wdl 字段"
+                             "存的是 Stockfish WDL，不是 λ-return）")
         wdl = recs["wdl"].astype(np.float32) / np.float32(SCALE)
         ws = wdl.sum(axis=1, keepdims=True)
         np.divide(wdl, ws, out=wdl, where=ws > 0)
